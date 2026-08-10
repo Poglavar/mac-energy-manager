@@ -1,0 +1,9 @@
+1	0	root	S0	/sbin/launchd
+700	1	alice	S1	/Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+701	700	alice	S2	/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=renderer
+702	700	alice	S3	/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=gpu-process
+800	1	alice	S4	/Applications/cmux.app/Contents/MacOS/cmux
+900	800	alice	S5	node /Users/alice/Code/thing/scrape.js
+902	900	alice	S6	/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=0 --no-first-run
+903	902	alice	S7	/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=renderer
+904	902	alice	S8	/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=gpu-process

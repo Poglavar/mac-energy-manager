@@ -1,0 +1,6 @@
+1	0	root	S0	/sbin/launchd
+100	1	alice	S10	/Applications/cmux.app/Contents/MacOS/cmux
+101	100	alice	S11	/opt/homebrew/bin/codex --session-id 019fab0a-a2ab-79e0-92f0-30fcc3fd5db7
+102	101	alice	S12	node /Users/alice/Code/thing/api.js
+600	1	alice	S1	/Applications/Docker.app/Contents/MacOS/com.docker.backend
+601	1	alice	S2	/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine

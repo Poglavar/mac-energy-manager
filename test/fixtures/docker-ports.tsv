@@ -1,0 +1,2 @@
+50db7928634e	webapp-db-1	postgis:17	0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp
+a98817917f8b	webapp-api-1	webapp-api	0.0.0.0:3000->3000/tcp

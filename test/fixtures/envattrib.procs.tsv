@@ -1,0 +1,5 @@
+1	0	root	Sat Jul 25 10:45:02 2026	/sbin/launchd
+100	1	alice	Sat Jul 25 10:48:00 2026	/Applications/cmux.app/Contents/MacOS/cmux
+104	100	alice	Sat Jul 25 10:49:03 2026	/Users/alice/.local/bin/claude --session-id e4cb37ec-72b5-4fe2-85b1-784c6ded7fc9
+600	1	alice	Sat Jul 25 10:52:00 2026	/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --headless --user-data-dir=/var/folders/9r/T/pw-profile-1
+601	600	alice	Sat Jul 25 10:52:01 2026	/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=renderer

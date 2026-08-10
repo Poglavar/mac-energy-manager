@@ -1,0 +1,245 @@
+#!/bin/bash
+# energy-graph — a fullscreen, standalone view of the whole live process forest:
+# every caller and everything it spawned, above an energy threshold you control.
+#
+# Independent of SwiftBar and of the menu: it is a pure READER of the rolling history
+# the plugin samples into ~/.cache/energy-manager, running the same lib/*.awk pipeline,
+# so the diagram and the menu bar can never disagree. It never samples on its own —
+# two samplers would corrupt each other's intervals (see lib/snapshot.sh).
+#
+# The page needs the plugin to be running to have fresh numbers to show; without it
+# the history goes stale and the page says so rather than drawing old data as current.
+
+set -u
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export LC_ALL=C LANG=C
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:$PATH"
+. "$REPO/lib/snapshot.sh"
+. "$REPO/lib/docker_clients.sh"
+
+PORT_DEFAULT=8787
+PIDFILE_DIR="${STATE_DIR}"
+
+usage() {
+  cat <<EOF
+energy-graph — fullscreen call-graph of everything currently drawing power
+
+usage: energy-graph <command> [port]
+
+  open  [port]   start the viewer if it is not up, then open it in your browser
+  start [port]   start the viewer in the background, without opening a browser
+  serve [port]   run the viewer in the foreground (Ctrl-C stops it)
+  stop  [port]   stop a viewer started by "open"
+  status[port]   is a viewer running on this port?
+  json  [min]    print the current graph as JSON on stdout (for debugging)
+  load  [n]      print total %cpu and the top n consumers as TSV (cheap; ~40 ms)
+
+port defaults to $PORT_DEFAULT and is bound to 127.0.0.1 only — nothing is exposed
+off this machine. "min" is the energy threshold in %cpu (default 0.3); processes
+whose whole subtree is below it are left out, which is what keeps the several
+hundred idle processes off the screen.
+EOF
+}
+
+# The cheap load reading: total %cpu across all processes plus the top consumers,
+# named by the shared labeller. One ps and one awk pass (~40 ms), deliberately not
+# the full forest pipeline — this is polled, and it must never race the sampler.
+load_tsv() {
+  ps -Ao %cpu=,command= -r | awk -v top_n="${1:-5}" \
+      -f "$REPO/lib/label.awk" -f "$REPO/lib/load.awk"
+}
+
+# One snapshot of the forest, as JSON. min = threshold, plumb = show wrapper processes.
+graph_json() {
+  local min="${1:-0.3}" plumb="${2:-0}"
+  local procs="$STATE_DIR/graph-procs.$$.tsv" energy="$STATE_DIR/graph-energy.$$.tsv"
+  local db_clients="$STATE_DIR/graph-dbclients.$$.tsv"
+  local attrib="$STATE_DIR/graph-attrib.$$.tsv"
+  mkdir -p "$STATE_DIR"; touch "$PARENTS" "$STATE_DIR/browser-owners.tsv" "$STATE_DIR/cmux-tabs.tsv"
+  em_procs "$procs"
+  em_energy "$procs" "$energy"
+  em_docker_db_clients "$db_clients"
+  em_attrib "$procs" "$attrib"
+  # top_n/max_rows are effectively unlimited here: the threshold is the only filter,
+  # because the whole point of this view is the parts the 12-row menu cannot show.
+  awk -v top_n=9999 -v max_rows=99999 -v tree_min="$min" -v root_min="$min" \
+      -v plumbing="$plumb" -v hog_min=3 -v db_force=1 \
+      -f "$REPO/lib/label.awk" -f "$REPO/lib/tree.awk" \
+      "$energy" "$PARENTS" "$procs" "$db_clients" "$STATE_DIR/browser-owners.tsv" "$STATE_DIR/cmux-tabs.tsv" "$attrib" \
+      | EM_CUR="$CUR" "$(em_python)" "$REPO/lib/graph_json.py"
+  rm -f "$procs" "$energy" "$db_clients" "$attrib"
+}
+
+serve() {
+  local port="$1"
+  exec env REPO="$REPO" GRAPH_PORT="$port" "$(em_python)" - <<'PY'
+import json, os, re, subprocess, time, urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+REPO = os.environ["REPO"]
+PORT = int(os.environ["GRAPH_PORT"])
+
+
+# Only pages served from this machine may read the process list. `*` would let
+# ANY site you happen to visit enumerate your running processes and command
+# lines, which is a real leak from a tool whose whole job is naming them. The
+# match is anchored and the port is bounded, so "http://localhost.evil.com" and
+# "http://127.0.0.1.evil.com" do not pass.
+LOCAL_ORIGIN = re.compile(r"^http://(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$")
+
+# Binding to 127.0.0.1 is NOT sufficient on its own, and the CORS check above does not
+# save you either. In a DNS-rebinding attack a page on evil.example is served while that
+# name still resolves to the attacker, then the name is re-resolved to 127.0.0.1: the
+# browser now considers http://evil.example:8787 SAME-ORIGIN with this server, so no
+# CORS check ever runs and the page can read everything. The defence is to check the
+# name the client used, because a rebound request necessarily carries the attacker's
+# hostname in Host. That matters here more than for most local servers: /data.json
+# returns full command lines, which routinely carry API keys and tokens.
+LOCAL_HOST = re.compile(r"^(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$", re.I)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _cors(self) -> None:
+        origin = self.headers.get("Origin", "")
+        if origin and LOCAL_ORIGIN.match(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+
+    def _local_host_only(self) -> bool:
+        if LOCAL_HOST.match(self.headers.get("Host", "")):
+            return True
+        self.send_response(403)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
+
+    def _send(self, body: bytes, ctype: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        # This page loads no scripts, styles, fonts or images from anywhere but itself,
+        # and talks to nothing off-box. Saying so means that even a future escape from
+        # the textContent-only rendering could not exfiltrate the process list.
+        self.send_header("Content-Security-Policy",
+                         "default-src 'none'; script-src 'unsafe-inline'; "
+                         "style-src 'unsafe-inline'; connect-src 'self'; "
+                         "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self._cors()
+        self.send_header("Content-Length", str(len(body)))
+        # Never cache: the whole page is a live reading, and a cached data.json would
+        # quietly show stale energy as if it were current.
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args) -> None:
+        """No request log. It would otherwise print to the terminal that started the
+        viewer and, in `start` mode, to a file nobody reads."""
+
+    def do_GET(self) -> None:
+        if not self._local_host_only():
+            return
+        url = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(url.query)
+        if url.path in ("/", "/index.html"):
+            with open(os.path.join(REPO, "web", "graph.html"), "rb") as fh:
+                self._send(fh.read(), "text/html; charset=utf-8")
+        elif url.path == "/data.json":
+            mn = q.get("min", ["0.3"])[0]
+            pl = q.get("plumbing", ["0"])[0]
+            try:                                   # never let a crafted query reach the shell
+                mn = str(max(0.0, min(100.0, float(mn))))
+            except ValueError:
+                mn = "0.3"
+            pl = "1" if pl == "1" else "0"
+            out = subprocess.run([os.path.join(REPO, "bin", "energy-graph"), "json", mn, pl],
+                                 capture_output=True, timeout=20)
+            self._send(out.stdout or b'{"nodes":[],"peak":0,"total":0,"generated":0}',
+                       "application/json")
+        elif url.path == "/load.json":
+            # Polled by dev tools that need to know whether a timing they just
+            # took is trustworthy — see "A Timing Measured On A Busy Machine Is
+            # Not A Measurement" in agents/AGENTS.md. Kept cheap on purpose.
+            try:
+                n = max(1, min(20, int(q.get("top", ["5"])[0])))
+            except ValueError:
+                n = 5
+            out = subprocess.run([os.path.join(REPO, "bin", "energy-graph"), "load", str(n)],
+                                 capture_output=True, timeout=10)
+            busy, top = 0.0, []
+            for line in out.stdout.decode("utf-8", "replace").splitlines():
+                parts = line.split("\t")
+                if parts[0] == "busy" and len(parts) > 1:
+                    busy = float(parts[1])
+                elif parts[0] == "proc" and len(parts) > 2:
+                    top.append({"cpu": float(parts[1]), "name": parts[2]})
+            cores = os.cpu_count() or 1
+            self._send(json.dumps({
+                "busyPct": busy,          # summed %cpu; on N cores this tops out near N*100
+                "cores": cores,
+                "busyPerCore": round(busy / (cores * 100.0), 3),
+                "loadAvg1": round(os.getloadavg()[0], 2),
+                "top": top,
+                "sampledAt": int(time.time()),
+            }).encode(), "application/json")
+        else:
+            self.send_error(404)
+
+    def do_OPTIONS(self) -> None:                  # preflight, for anything non-simple
+        self.send_response(204)
+        self._cors()
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *_a) -> None:            # a request log per 5s poll is noise
+        pass
+
+
+print(f"energy-graph on http://127.0.0.1:{PORT}  (Ctrl-C to stop)", flush=True)
+ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+PY
+}
+
+is_up() { curl -fsS --max-time 2 "http://127.0.0.1:$1/data.json?min=99" >/dev/null 2>&1; }
+
+cmd="${1:-}"; arg="${2:-}"
+case "$cmd" in
+  json)
+    graph_json "${2:-0.3}" "${3:-0}" ;;
+  load)
+    load_tsv "${arg:-5}" ;;
+  serve)
+    serve "${arg:-$PORT_DEFAULT}" ;;
+  open|start)
+    port="${arg:-$PORT_DEFAULT}"
+    if ! is_up "$port"; then
+      # Detached on purpose: started from a menu click or a shell that is about to
+      # exit, a foreground server would die with its parent and the link would 404.
+      nohup "$0" serve "$port" >"$STATE_DIR/graph.log" 2>&1 &
+      echo $! > "$PIDFILE_DIR/graph.$port.pid"
+      for _ in 1 2 3 4 5 6 7 8 9 10; do is_up "$port" && break; done
+    fi
+    if [ "$cmd" = open ]; then /usr/bin/open "http://127.0.0.1:$port/"
+    else echo "http://127.0.0.1:$port/"; fi ;;
+  stop)
+    port="${arg:-$PORT_DEFAULT}"
+    # is_up first, so we never signal whatever unrelated thing happens to hold the
+    # port. Then kill both what we recorded and whatever is actually listening — the
+    # pidfile is gone whenever the viewer was started by hand rather than by "open".
+    if ! is_up "$port"; then echo "not running"; exit 0; fi
+    pf="$PIDFILE_DIR/graph.$port.pid"
+    for p in $(cat "$pf" 2>/dev/null) $(lsof -t -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null); do
+      kill "$p" 2>/dev/null
+    done
+    rm -f "$pf"; echo "stopped" ;;
+  status)
+    port="${arg:-$PORT_DEFAULT}"
+    is_up "$port" && echo "running on http://127.0.0.1:$port/" || echo "not running" ;;
+  ""|-h|--help|help)
+    usage ;;
+  *)
+    usage; exit 1 ;;
+esac

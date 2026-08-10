@@ -1,0 +1,10 @@
+1	0	root	S0	/sbin/launchd
+700	1	alice	S1	/Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+701	700	alice	S2	/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=renderer
+702	700	alice	S3	/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=gpu-process
+800	1	alice	S4	/Applications/cmux.app/Contents/MacOS/cmux
+850	800	alice	S5	/opt/homebrew/bin/codex
+900	1	alice	S6	/Users/alice/.nvm/bin/agent-browser-darwin-arm64
+902	900	alice	S7	/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=0 --user-data-dir=/tmp/agent-browser-chrome-test
+903	902	alice	S8	/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=renderer
+904	902	alice	S9	/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=gpu-process

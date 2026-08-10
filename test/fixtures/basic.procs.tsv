@@ -1,0 +1,11 @@
+1	0	root	Sat Jul 25 10:45:02 2026	/sbin/launchd
+100	1	alice	Sat Jul 25 10:48:00 2026	/Applications/cmux.app/Contents/MacOS/cmux
+101	100	alice	Sat Jul 25 10:49:00 2026	/usr/bin/login -flp alice /bin/bash --noprofile --norc -c exec -l /bin/zsh
+102	101	alice	Sat Jul 25 10:49:01 2026	-/bin/zsh
+103	102	alice	Sat Jul 25 10:49:02 2026	/bin/zsh -lic cd -- '/Users/alice/Code/webapp' 2>/dev/null
+104	103	alice	Sat Jul 25 10:49:03 2026	/Users/alice/.local/bin/claude --session-id e4cb37ec-72b5-4fe2-85b1-784c6ded7fc9 --settings {}
+105	104	alice	Sat Jul 25 11:00:00 2026	caffeinate -i -t 300
+200	1	alice	Sat Jul 25 10:47:00 2026	/Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+201	200	alice	Sat Jul 25 10:47:10 2026	/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=renderer
+202	200	alice	Sat Jul 25 10:47:11 2026	/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=gpu-process
+300	1	root	Sat Jul 25 10:45:10 2026	/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon

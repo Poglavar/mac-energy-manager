@@ -1,0 +1,6 @@
+1	0	root	Sat Jul 25 10:45:02 2026	/sbin/launchd
+200	1	alice	Sat Jul 25 10:48:00 2026	/Applications/Ghostty.app/Contents/MacOS/Ghostty
+201	200	alice	Sat Jul 25 10:49:00 2026	-/bin/zsh
+202	201	alice	Sat Jul 25 10:49:03 2026	/Users/alice/.local/bin/claude --session-id aaaaaaaa-72b5-4fe2-85b1-784c6ded7fc9
+300	1	alice	Sat Jul 25 10:50:00 2026	/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal
+301	300	alice	Sat Jul 25 10:50:01 2026	/opt/homebrew/bin/codex

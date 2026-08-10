@@ -1,0 +1,6 @@
+1	0	root	Sat Jul 25 10:45:02 2026	/sbin/launchd
+100	1	alice	Sat Jul 25 10:48:00 2026	/Users/alice/Downloads/cmux Feature Branch.app/Contents/MacOS/cmux
+101	100	alice	Sat Jul 25 10:49:00 2026	/usr/bin/login -flp alice /bin/bash --noprofile --norc -c exec -l /bin/zsh
+102	101	alice	Sat Jul 25 10:49:01 2026	-/bin/zsh
+104	102	alice	Sat Jul 25 10:49:03 2026	/Users/alice/.local/bin/claude --session-id 7ba7d89b-72b5-4fe2-85b1-784c6ded7fc9 --settings {}
+106	102	alice	Sat Jul 25 10:49:05 2026	/Users/alice/.local/bin/claude --session-id deadbeef-72b5-4fe2-85b1-784c6ded7fc9 --settings {}

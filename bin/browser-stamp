@@ -1,0 +1,114 @@
+#!/bin/bash
+# browser-stamp — records WHO is launching an automation browser, at the only moment
+# that is knowable: launch.
+#
+#   open -na "Google Chrome" --args --user-data-dir="$(browser-stamp frames)" ...
+#   browser-stamp --pid 26345              # an already-running daemon (agent-browser)
+#
+# macOS reparents a detached browser to launchd within milliseconds of launch, which is
+# far inside the energy monitor's 10-second sampling interval — so by the time any
+# sampler looks, the browser is a top-level app with no parent, and the core it burns
+# cannot be billed to the agent session that opened it. No amount of polling recovers
+# that; the link has to be written down here.
+#
+# Two kinds of record, because there are two kinds of launcher:
+#
+#   /tmp/agent-chrome/<owner>-<name>   a hand-launched Chrome, keyed by its profile
+#                                      path — Chrome repeats --user-data-dir into the
+#                                      argv of every helper, so one row covers the tree
+#   pid:<n>                            a process, keyed by pid+start — used for the
+#                                      agent-browser daemon, whose Chrome is already
+#                                      correctly parented to it
+#
+# Either way the row is self-cleaning: it is dropped as soon as its owner is gone.
+
+set -euo pipefail
+
+STATE_DIR="${STATE_DIR:-$HOME/.cache/energy-manager}"
+OWNERS="${OWNERS:-$STATE_DIR/browser-owners.tsv}"
+ROOT="${BROWSER_STAMP_ROOT:-/tmp/agent-chrome}"
+AGENT_RE='^(claude|codex|copilot|aider|gemini|cursor-agent)$'
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: browser-stamp <name>          print a stamped --user-data-dir, record the owner
+       browser-stamp --pid <pid>     record an already-running process as owned
+       browser-stamp --list          show current owner records
+       browser-stamp --owner         print the owner this shell would be stamped as
+
+The name identifies the browser, not the owner (e.g. "frames", "isochrone"); the
+owner is prepended so two sessions asking for the same name get separate profiles.
+EOF
+  exit 2
+}
+
+# Same shape as lib/snapshot.sh's START field, so tree.awk can compare them directly:
+# "Sat Aug  8 13:42:58 2026" -> "Sat_Aug_8_13:42:58_2026".
+pstart() { ps -o lstart= -p "$1" 2>/dev/null | awk 'NF{print $1"_"$2"_"$3"_"$4"_"$5}'; }
+
+pcomm() { local c; c=$(ps -o comm= -p "$1" 2>/dev/null) || return 1; c=${c##*/}; printf '%s' "${c#-}"; }
+
+# The nearest coding agent above this shell. Shells and login wrappers are skipped
+# rather than blamed — billing a browser to "zsh" would be true and useless. Stop at
+# cmux: above it there is nothing session-specific left to learn.
+find_owner() {
+  local p=$PPID b i
+  for ((i = 0; i < 32; i++)); do
+    [ "${p:-0}" -gt 1 ] 2>/dev/null || break
+    b=$(pcomm "$p") || break
+    [ -n "$b" ] || break
+    [[ $b =~ $AGENT_RE ]] && { printf '%s' "$p"; return; }
+    [ "$b" = "cmux" ] && break
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+  done
+  printf '%s' "$PPID"          # no agent above us: the caller owns it
+}
+
+# Rewrite rather than append: a row whose owner has exited (or whose pid was recycled
+# into a different process) is stale, and a stale row would graft a browser tree onto a
+# stranger. Checking on every write keeps the file the size of the live session set.
+record() {
+  local key=$1 owner=$2 ostart=$3 label=$4 tmp="$OWNERS.tmp.$$"
+  mkdir -p "$STATE_DIR"
+  {
+    [ -f "$OWNERS" ] && awk -F'\t' -v skip="$key" '
+      $1 != skip && $2 ~ /^[0-9]+$/ {
+        cmd = "ps -o lstart= -p " $2 " 2>/dev/null"
+        l = ""; cmd | getline l; close(cmd)
+        if (split(l, a, " ") >= 5 && a[1] "_" a[2] "_" a[3] "_" a[4] "_" a[5] == $3) print
+      }' "$OWNERS"
+    printf '%s\t%s\t%s\t%s\n' "$key" "$owner" "$ostart" "$label"
+  } > "$tmp"
+  mv "$tmp" "$OWNERS"
+}
+
+case "${1:-}" in
+  ''|-h|--help) usage ;;
+  --list) [ -f "$OWNERS" ] && cat "$OWNERS" || echo "no owner records" >&2; exit 0 ;;
+  --owner) o=$(find_owner); printf '%s\t%s\n' "$o" "$(pcomm "$o" || echo unknown)"; exit 0 ;;
+  --pid)
+    dpid=${2:-}
+    [[ $dpid =~ ^[0-9]+$ ]] || usage
+    dstart=$(pstart "$dpid")
+    [ -n "$dstart" ] || exit 0                     # already gone: nothing worth recording
+    owner=$(find_owner)
+    [ "$owner" = "$dpid" ] && exit 0               # never make a process own itself
+    # The daemon's own start time is part of the key, so the row stops matching the
+    # instant that pid is recycled — the same guard the owner side gets from its start
+    # time, applied to the other end of the link.
+    record "pid:$dpid:$dstart" "$owner" "$(pstart "$owner")" "$(pcomm "$owner" || echo unknown)"
+    exit 0 ;;
+esac
+
+name=${1//[^A-Za-z0-9._-]/_}
+owner=$(find_owner)
+
+# The profile path is per-owner, not just per-name. Two agents both asking for "frames"
+# must not land on one profile: Chrome would attach the second launch to the first
+# instance, so one session would silently drive another's browser and the owner row
+# would be overwritten. Reusing a name *within* a session still reuses the profile,
+# which is the intended behaviour.
+profile="$ROOT/$owner-$name"
+mkdir -p "$profile"
+record "$profile" "$owner" "$(pstart "$owner")" "$(pcomm "$owner" || echo unknown)"
+printf '%s\n' "$profile"

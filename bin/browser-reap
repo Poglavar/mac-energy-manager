@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+# Kill leaked automation browsers.
+#
+# Why this exists: an abandoned automation Chrome does not sit quietly. It keeps rendering whatever
+# page it was left on — a map, a 3D world — and burns a core doing it. They accumulate across coding
+# sessions until the machine crawls. One session was measured at load average 74 on an 8 cores with
+# 13 leftover instances, which also made the test suite flaky.
+#
+# Asking the agent to close them is necessary but NOT sufficient: a session that runs out of context,
+# is Ctrl-C'd, or is killed never gets a turn in which to clean up, and Claude Code's SessionEnd hook
+# is not documented to fire on those paths either. So this runs on a timer and does not depend on
+# anyone remembering.
+#
+# What counts as an automation browser: a Chrome/Chromium process whose --user-data-dir points into a
+# temp location (/tmp, /var/folders/..., $TMPDIR). That covers agent-browser sessions, Playwright and
+# Puppeteer (both park their profiles in $TMPDIR), and the hand-launched
+# `open -na "Google Chrome" --args --user-data-dir=/tmp/chrome-...` pattern used for frame-dependent
+# work. The real browser keeps its profile in ~/Library/Application Support and is therefore never a
+# candidate — that discriminator is the whole safety story, so keep it strict.
+#
+# It is deliberately agent-agnostic: it reaps by what the process IS, not by who started it, so a
+# browser leaked by codex, gemini, copilot or a stray npm script is cleaned up exactly like Claude's.
+# Known gap: Firefox/WebKit automation uses `-profile`, not `--user-data-dir`, so it is not covered.
+#
+# Killing is cheap and recoverable: `agent-browser open` relaunches on demand. The only thing lost is
+# in-browser state (a logged-in session), which is rare here.
+#
+# AGE IS THE WRONG QUESTION, and so is owner liveness. What matters is HOW LONG SINCE ANYONE
+# DROVE THIS BROWSER.
+#
+# Age fails because a browser in continuous use gets older every minute and is not garbage.
+# Owner liveness fails for the opposite reason: a cmux agent session runs for days or weeks, so
+# "the owner is still alive" is very nearly a constant, and keying a lease to it hands every
+# forgotten browser an unlimited one. That was this script's original design and it was wrong.
+#
+# Measured over 417 real browser lifetimes reconstructed from coding-agent transcripts:
+#   - 87% received two or more commands, so browsers ARE reused — "opened, used once, done"
+#     is false and a reaper built on it would kill live ones;
+#   - but reuse is FAST: median idle gap between commands 1.2 min, p75 2.5 min, p90 7.5 min.
+# So a browser idle for fifteen minutes is finished with overwhelming probability, no matter
+# what its owner is doing — and one being driven every two minutes is never touched, no matter
+# how old. Hence --idle-ttl as the primary rule.
+#
+# Idle time comes from the agent-browser wrapper, which stamps a per-daemon marker on every
+# command. A hand-launched browser has no such hot path, so nothing reports its usage and it
+# falls back to total age (--ttl). A browser whose owner has EXITED cannot be in use by anyone
+# and gets the shortest fuse of all (--orphan-ttl).
+#
+# A browser with NO owner record is treated as *unknown*, not as garbage, and keeps the age
+# fallback — Playwright and Puppeteer do not stamp, and a 12-minute test run must not be shot
+# in the back.
+#
+#   browser-reap                 reap by TTL (default 15 min idle / 45 min age / 10 min orphaned)
+#   browser-reap --idle-ttl 15   TTL measured from the last command sent to the browser
+#   browser-reap --ttl 30        fallback TTL on total age, when usage is not reported
+#   browser-reap --orphan-ttl 0  TTL for browsers whose owner has exited (0 = immediately)
+#   browser-reap --all           reap every automation browser regardless of age
+#   browser-reap --session-end   reap all IF no other agent session is running, else fall back to TTL
+#   browser-reap --status        show what is running, with owner, kill nothing
+#   browser-reap --dry-run       show what WOULD be killed
+#   browser-reap --report        what it has actually killed, and what that was costing
+#   browser-reap --report --since 2026-09-01    same, over a window
+#   browser-reap --install [sec] install the launchd timer (default every 300s)
+#   browser-reap --uninstall     remove the timer, keep the ledger
+set -uo pipefail
+
+TTL_MIN=45          # fallback: total age, for browsers nothing reports usage for
+IDLE_TTL_MIN=15     # primary: minutes since the browser was last driven
+ORPHAN_TTL_MIN=10   # owner process is gone, so nothing can be driving it
+MODE=reap
+DRY=0
+OWNERS="${OWNERS:-${STATE_DIR:-$HOME/.cache/energy-manager}/browser-owners.tsv}"
+ACTIVITY="${STATE_DIR:-$HOME/.cache/energy-manager}/browser-activity"
+
+# The script owns its log rather than letting launchd redirect stdout, so the path lives in one
+# place, manual runs are recorded too, and --report always reads what the timer actually wrote.
+# NOT /tmp: a ledger that a reboot erases cannot answer "has this been worth it over the month".
+LOG="${BROWSER_REAP_LOG:-$HOME/Library/Logs/browser-reap.log}"
+LOG_MAX_LINES=5000
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --ttl) TTL_MIN="${2:-45}"; shift 2 ;;
+        --idle-ttl) IDLE_TTL_MIN="${2:-15}"; shift 2 ;;
+        --orphan-ttl) ORPHAN_TTL_MIN="${2:-10}"; shift 2 ;;
+        --all) MODE=all; shift ;;
+        --session-end) MODE=session-end; shift ;;
+        --status) MODE=status; shift ;;
+        --report) MODE=report; shift ;;
+        --since) SINCE="${2:-}"; shift 2 ;;
+        --dry-run) DRY=1; shift ;;
+        --install) MODE=install; INTERVAL="${2:-300}"; case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=300; shift ;; *) shift 2 ;; esac ;;
+        --uninstall) MODE=uninstall; shift ;;
+        -h|--help) sed -n '1,62p' "$0"; exit 0 ;;
+        *) echo "browser-reap: unknown option $1" >&2; exit 2 ;;
+    esac
+done
+
+# ---- the timer ---------------------------------------------------------------
+# Instructions cannot enforce this: a session that runs out of context, is Ctrl-C'd or
+# is killed never gets a turn in which to clean up. So it runs on launchd, and the
+# plist is generated rather than hand-written — a hand-written one carries absolute
+# paths that are wrong on every machine but the author's.
+LAUNCH_LABEL="app.energymanager.reap"
+PLIST="$HOME/Library/LaunchAgents/$LAUNCH_LABEL.plist"
+
+install_agent() {
+    local self; self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    mkdir -p "$(dirname "$PLIST")"
+    # The script is executable and has a shebang, so it is the Program itself rather
+    # than an argument to bash. That is what macOS Login Items shows as the item's
+    # name — "browser-reap" instead of an anonymous "bash" nobody can identify.
+    cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$LAUNCH_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$self</string>
+        <string>--ttl</string><string>$TTL_MIN</string>
+        <string>--idle-ttl</string><string>$IDLE_TTL_MIN</string>
+        <string>--orphan-ttl</string><string>$ORPHAN_TTL_MIN</string>
+    </array>
+    <key>StartInterval</key><integer>$INTERVAL</integer>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>ProcessType</key><string>Background</string>
+    <key>LowPriorityIO</key><true/>
+    <key>StandardOutPath</key><string>/dev/null</string>
+    <key>StandardErrorPath</key><string>$HOME/Library/Logs/browser-reap.err</string>
+</dict>
+</plist>
+PLISTEOF
+    # EDITING A PLIST DOES NOT CHANGE A LOADED JOB. launchd keeps serving the definition
+    # it was given at bootstrap time, so a re-run that only rewrites the file leaves the
+    # old interval in force — and `launchctl list` still shows a healthy exit status, so
+    # nothing looks wrong. This job once sat for hours registered and never firing.
+    launchctl bootout "gui/$UID/$LAUNCH_LABEL" 2>/dev/null
+    launchctl bootstrap "gui/$UID" "$PLIST" || { echo "browser-reap: bootstrap failed" >&2; exit 1; }
+    echo "browser-reap: installed, every ${INTERVAL}s (idle ${IDLE_TTL_MIN}m, age ${TTL_MIN}m, orphan ${ORPHAN_TTL_MIN}m)"
+    # Verify from launchd, never from the file just written — that is the whole point.
+    launchctl print "gui/$UID/$LAUNCH_LABEL" 2>/dev/null | grep -E 'run interval|state' | sed 's/^/  /'
+}
+
+case "$MODE" in
+    install)   install_agent; exit 0 ;;
+    uninstall) launchctl bootout "gui/$UID/$LAUNCH_LABEL" 2>/dev/null
+               rm -f "$PLIST"
+               echo "browser-reap: timer removed (ledger at $LOG kept)"; exit 0 ;;
+esac
+
+# "1-02:03:04" / "02:03:04" / "03:04" -> seconds
+etime_seconds() {
+    local e="$1" days=0 rest="$1" secs=0 p
+    case "$e" in *-*) days="${e%%-*}"; rest="${e#*-}" ;; esac
+    for p in $(printf '%s' "$rest" | tr ':' ' '); do
+        secs=$(( secs * 60 + 10#$p ))
+    done
+    printf '%s' $(( days * 86400 + secs ))
+}
+
+# Emit "<age_seconds>\t<profile_dir>\t<pid,pid,...>\t<root_ppid>" per automation browser instance.
+# Ages come from the OLDEST process in the group, which is the instance's real age. root_ppid is
+# what the group's top process hangs off — for an agent-browser Chrome that is its daemon, which is
+# where the ownership record lives (the profile is a UUID agent-browser picked, not one we stamped).
+collect() {
+    # The temp --user-data-dir is what makes something automation; the name match is only a
+    # secondary sanity filter, so keep it BROAD or it silently misses things. "chrom" covers Chrome,
+    # Chromium and Google Chrome for Testing; the shells are Playwright's headless_shell and
+    # Puppeteer's chrome-headless-shell, neither of which matches a "google chrome" pattern.
+    ps -axo pid=,ppid=,etime=,command= 2>/dev/null \
+    | grep -- '--user-data-dir=' \
+    | grep -Ei 'chrom|headless_shell' \
+    | while read -r pid ppid etime rest; do
+        dir="${rest##*--user-data-dir=}"
+        dir="${dir%% *}"
+        case "$dir" in
+            /tmp/*|/private/tmp/*|/var/folders/*|/private/var/folders/*) ;;
+            *) continue ;;
+        esac
+        echo "$(etime_seconds "$etime")|$dir|$pid|$ppid"
+    done \
+    | awk -F'|' '
+        { if (!($2 in age) || $1 > age[$2]) age[$2] = $1
+          pids[$2] = ($2 in pids) ? pids[$2] "," $3 : $3
+          mine[$3] = $2; par[$3] = $4 }
+        END {
+          # The group root is the member whose parent is NOT itself a member; its parent is the
+          # launcher (a daemon, or launchd for a hand-launched browser).
+          for (p in mine) if (!(par[p] in mine)) rootpp[mine[p]] = par[p]
+          for (d in age) printf "%d\t%s\t%s\t%s\n", age[d], d, pids[d], (d in rootpp ? rootpp[d] : 1)
+        }
+      ' \
+    | sort -rn
+}
+
+# "alive" | "dead" | "unknown" for the session that launched this browser. Keyed either by the
+# profile path we stamped (hand-launched Chrome) or by pid+start of the launcher (agent-browser's
+# daemon). Start times are compared on both ends so a recycled pid can never make a dead owner
+# look alive — which would turn "kill this now" into "leave it running for another 45 minutes".
+# Seconds since this browser was last driven, or "" when nothing records that.
+#
+# WHY THIS BEATS AGE AND OWNERSHIP. Measured over 417 real browser lifetimes in coding
+# transcripts: 87% got two or more commands, so browsers ARE reused and a naive
+# "one use then dead" assumption would kill live ones. But the reuse is fast — median
+# idle gap 1.2 min, p90 7.5 min — so a browser idle for 15 minutes is finished with
+# overwhelming probability, whatever its owner is doing. Owner liveness cannot carry
+# that decision: a cmux session runs for weeks, so "owner alive" is nearly a constant
+# and hands every idle browser an unlimited lease.
+#
+# Written by the agent-browser wrapper on every command. A hand-launched browser has no
+# such hot path, so it returns "" and falls back to age — the honest degradation.
+idle_seconds() {
+    local rootpp="$1" f mtime
+    f="$ACTIVITY/pid-$rootpp"
+    [ -f "$f" ] || { printf ''; return; }
+    mtime=$(stat -f %m "$f" 2>/dev/null) || { printf ''; return; }
+    printf '%s' "$(( $(date +%s) - mtime ))"
+}
+
+owner_state() {
+    local dir="$1" rootpp="$2" row ownpid ownstart key pstart
+    [ -r "$OWNERS" ] || { printf 'unknown'; return; }
+    row=$(grep -F "$dir"$'\t' "$OWNERS" 2>/dev/null | head -1)
+    if [ -z "$row" ] && [ "${rootpp:-1}" -gt 1 ] 2>/dev/null; then
+        pstart=$(ps -o lstart= -p "$rootpp" 2>/dev/null | awk 'NF{print $1"_"$2"_"$3"_"$4"_"$5}')
+        [ -n "$pstart" ] && key="pid:$rootpp:$pstart" \
+            && row=$(grep -F "$key"$'\t' "$OWNERS" 2>/dev/null | head -1)
+    fi
+    [ -z "$row" ] && { printf 'unknown'; return; }
+    ownpid=$(printf '%s' "$row" | cut -f2)
+    ownstart=$(printf '%s' "$row" | cut -f3)
+    pstart=$(ps -o lstart= -p "$ownpid" 2>/dev/null | awk 'NF{print $1"_"$2"_"$3"_"$4"_"$5}')
+    if [ -n "$pstart" ] && [ "$pstart" = "$ownstart" ]; then printf 'alive'; else printf 'dead'; fi
+}
+
+owner_label() {
+    [ -r "$OWNERS" ] || return 0
+    grep -F "$1"$'\t' "$OWNERS" 2>/dev/null | head -1 | cut -f4
+}
+
+human_age() {
+    local s="$1"
+    if [ "$s" -ge 3600 ]; then printf '%dh%02dm' $((s/3600)) $(((s%3600)/60));
+    else printf '%dm' $((s/60)); fi
+}
+
+# Other live coding-agent sessions, excluding this script's own parent. Deliberately NOT
+# Claude-only: codex, gemini and copilot drive browsers through the same agent-browser/Playwright
+# machinery, so "nobody is home, reap everything" must mean nobody at all — otherwise a Claude
+# session ending would kill a browser codex is actively using.
+other_agent_sessions() {
+    pgrep -f '(/|^)(claude|codex|gemini|copilot)( |$)' 2>/dev/null \
+        | grep -vc "^$PPID$" || echo 0
+}
+
+# One timestamped line per scheduled run, ALWAYS — including runs with nothing to do.
+# A reaper that silently stops running looks exactly like a reaper with nothing to reap, and this
+# job spent hours in that state: registered, LastExitStatus 0, and never firing, because the plist
+# was edited after it was loaded. A log whose last line is old is now the symptom.
+logline() {
+    mkdir -p "$(dirname "$LOG")" 2>/dev/null
+    printf '%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG" 2>/dev/null
+    # Bounded so a ledger kept for months cannot grow without limit. Trimming from the front keeps
+    # the recent history that --report's default window reads.
+    if [ -f "$LOG" ] && [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt $((LOG_MAX_LINES * 2)) ]; then
+        tail -n "$LOG_MAX_LINES" "$LOG" > "$LOG.trim" 2>/dev/null && mv "$LOG.trim" "$LOG"
+    fi
+}
+
+heartbeat() {
+    [ "$MODE" = status ] && return 0
+    [ "$DRY" -eq 1 ] && return 0
+    printf '[%s] browser-reap: %s (ttl %sm owned / %sm orphaned)\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$TTL_MIN" "$ORPHAN_TTL_MIN"
+    logline "RUN	$1"
+}
+
+# What page the browser was on, so the ledger records what was actually being rendered
+# rather than only a profile path. Chrome writes the port it got into the profile, so this
+# works for --remote-debugging-port=0 too. Must be read BEFORE the kill: the endpoint dies
+# with the browser. Silent and bounded — a browser with no debug port just has no title.
+cdp_page() {
+    local port title
+    port=$(head -1 "$1/DevToolsActivePort" 2>/dev/null | tr -d ' \r')
+    case "$port" in ''|*[!0-9]*) return ;; esac
+    command -v curl >/dev/null 2>&1 || return
+    title=$(curl -sS --max-time 1 "http://127.0.0.1:$port/json/list" 2>/dev/null \
+        | awk -F'"' '/"title":/ { print $4; exit }')
+    printf '%s' "$title"
+}
+
+# What a group is burning right now, summed across its processes. macOS ps %cpu is a decaying
+# average over roughly the last minute, which is the right shape here: it says what this browser
+# was costing at the moment it died, not what it averaged over a lifetime that was mostly idle.
+group_cpu() {
+    printf '%s' "$1" | tr ',' '\n' | while read -r p; do
+        [ -n "$p" ] && ps -o %cpu= -p "$p" 2>/dev/null
+    done | awk '{s += $1} END {printf "%.1f", s + 0}'
+}
+
+# "Has this paid for itself" — read from the ledger, not from anyone's opinion of it.
+report() {
+    [ -r "$LOG" ] || { echo "browser-reap: no log at $LOG (has the timer ever run?)"; return 1; }
+    awk -F'\t' -v since="${1:-0000-00-00}" '
+        $1 >= since && $2 == "KILL" {
+            n++; procs += $3; cpu += $5; agemin += $4
+            if ($5 > worstcpu) { worstcpu = $5; worstdir = $7 }
+            if ($4 > worstage) worstage = $4
+            if ($6 == "owner-gone") orphans++
+        }
+        $1 >= since && $2 == "RUN" { runs++ }
+        $1 >= since { if (first == "") first = $1; last = $1 }
+        END {
+            if (runs == 0 && n == 0) { print "browser-reap: nothing logged in this window"; exit }
+            printf "browser-reap ledger  %s  ->  %s\n", first, last
+            printf "  %d runs, %d browser instance(s) killed (%d processes)\n", runs, n, procs
+            printf "  %d of those had a dead owner — unambiguous garbage\n", orphans + 0
+            if (n > 0) {
+                printf "  they were burning %.0f%% CPU in aggregate when killed (avg %.0f%% each)\n", cpu, cpu / n
+                printf "  they had already been leaking %.0f min on average, worst %.0f min\n", agemin / n, worstage
+                printf "  worst single instance: %.0f%% CPU — %s\n", worstcpu, worstdir
+            }
+            printf "\n  The CPU figure is a RATE at the moment of the kill, not a total saved:\n"
+            printf "  how long each would have survived unattended is not knowable, so no\n"
+            printf "  cumulative \"hours reclaimed\" number here would be honest.\n"
+        }' "$LOG"
+}
+
+if [ "$MODE" = report ]; then report "${SINCE:-0000-00-00}"; exit $?; fi
+
+INSTANCES="$(collect)"
+
+if [ -z "$INSTANCES" ]; then
+    [ "$MODE" = status ] && echo "browser-reap: no automation browsers running"
+    heartbeat "nothing running"
+    exit 0
+fi
+
+if [ "$MODE" = status ]; then
+    echo "browser-reap: automation browsers running"
+    while IFS=$'\t' read -r age dir pids rootpp; do
+        [ -z "$dir" ] && continue
+        st=$(owner_state "$dir" "$rootpp")
+        idle=$(idle_seconds "$rootpp")
+        who=$(owner_label "$dir"); [ -n "$who" ] || who="?"
+        case "$st" in
+            alive)   own="owner $who (alive)" ;;
+            dead)    own="owner $who — GONE, reaped after ${ORPHAN_TTL_MIN}m" ;;
+            *)       own="unstamped" ;;
+        esac
+        # Show the number the decision is actually made on, not just how old it is.
+        if [ "$st" = dead ]; then verdict="dies at ${ORPHAN_TTL_MIN}m age"
+        elif [ -n "$idle" ]; then verdict="idle $(human_age "$idle"), dies at ${IDLE_TTL_MIN}m idle"
+        else verdict="usage not reported, dies at ${TTL_MIN}m age"; fi
+        printf '  %-8s %-3s procs  %-46s %s\n' "$(human_age "$age")" \
+            "$(echo "$pids" | tr ',' '\n' | wc -l | tr -d ' ')" "$dir" "$own"
+        printf '  %-8s %-3s         %s\n' "" "" "$verdict"
+    done <<< "$INSTANCES"
+    exit 0
+fi
+
+if [ "$MODE" = session-end ]; then
+    if [ "$(other_agent_sessions)" -le 0 ]; then MODE=all; else MODE=reap; fi
+fi
+
+TTL_SEC=$(( TTL_MIN * 60 ))
+IDLE_TTL_SEC=$(( IDLE_TTL_MIN * 60 ))
+ORPHAN_TTL_SEC=$(( ORPHAN_TTL_MIN * 60 ))
+KILLED=0
+SPARED=0
+
+# Best effort: let agent-browser tear its own sessions down first so its bookkeeping stays clean.
+# Backgrounded with a bounded wait — a wedged daemon must not hold up the kill below.
+if [ "$MODE" = all ] && [ "$DRY" -eq 0 ] && command -v agent-browser >/dev/null 2>&1; then
+    ( agent-browser close --all >/dev/null 2>&1 &
+      ab=$!; for _ in $(seq 1 20); do kill -0 "$ab" 2>/dev/null || break; sleep 0.5; done
+      kill -9 "$ab" 2>/dev/null ) >/dev/null 2>&1
+    INSTANCES="$(collect)"
+fi
+
+while IFS=$'\t' read -r age dir pids rootpp; do
+    [ -z "$dir" ] && continue
+    st=$(owner_state "$dir" "$rootpp")
+    idle=$(idle_seconds "$rootpp")
+    # Prefer "how long since anyone drove this" over "how long has it existed". A browser
+    # in constant use is never killed however old it is; an idle one dies on schedule
+    # however alive its owner is. Age is the fallback for browsers nothing reports on.
+    if [ "$st" = dead ]; then
+        measure=$age; limit=$ORPHAN_TTL_SEC; why="owner gone"
+    elif [ -n "$idle" ]; then
+        measure=$idle; limit=$IDLE_TTL_SEC; why="idle $(human_age "$idle")"
+    else
+        measure=$age; limit=$TTL_SEC; why="age, unmonitored"
+    fi
+    if [ "$MODE" != all ] && [ "$measure" -lt "$limit" ]; then SPARED=$((SPARED + 1)); continue; fi
+    n=$(echo "$pids" | tr ',' '\n' | grep -c .)
+    if [ "$DRY" -eq 1 ]; then
+        echo "browser-reap: WOULD kill $n proc(s), age $(human_age "$age"), $why — $dir"
+        continue
+    fi
+    cpu=$(group_cpu "$pids")          # measured BEFORE the kill, or there is nothing left to read
+    page=$(cdp_page "$dir")           # likewise: the debug port dies with the browser
+    echo "$pids" | tr ',' '\n' | while read -r p; do [ -n "$p" ] && kill -9 "$p" 2>/dev/null; done
+    echo "browser-reap: killed $n proc(s), age $(human_age "$age"), ${cpu}% cpu, $why — $dir${page:+ [$page]}"
+    logline "KILL	$n	$((age / 60))	$cpu	$([ "$st" = dead ] && echo owner-gone || echo aged-out)	$dir	$page"
+    KILLED=$((KILLED + 1))
+done <<< "$INSTANCES"
+
+# agent-browser writes one <name>.config per session name it has ever seen and never removes them;
+# they are pure residue once nothing is running (228 had piled up since June). Only prune when no
+# automation browser survives, so a live session's config is never taken out from under it.
+if [ "$DRY" -eq 0 ] && [ -z "$(collect)" ] && [ -d "$HOME/.agent-browser" ]; then
+    find "$HOME/.agent-browser" -maxdepth 1 -name '*.config' -mtime +2 -delete 2>/dev/null
+fi
+
+heartbeat "$KILLED instance(s) killed, $SPARED under TTL"
+
+exit 0

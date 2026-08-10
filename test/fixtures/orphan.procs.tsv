@@ -1,0 +1,4 @@
+1	0	root	S0	/sbin/launchd
+400	1	alice	S1	/Applications/cmux.app/Contents/MacOS/cmux
+402	1	alice	S3	node /Users/alice/Code/thing/worker.js
+500	1	alice	S5	/Applications/Telegram.app/Contents/MacOS/Telegram

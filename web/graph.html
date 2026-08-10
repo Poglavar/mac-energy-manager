@@ -1,0 +1,566 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mac-energy-manager — call graph</title>
+<style>
+/* Sequential blue ramp, five steps, from the design system's blue scale. Validated
+   with the palette validator in both modes (monotone lightness, adjacent ΔL ≥ 0.06,
+   light end clears 2:1 on its surface, single hue). Bins are ABSOLUTE %cpu, not
+   relative to the current peak, so a process keeps its colour between refreshes —
+   a rank-relative ramp would repaint everything every time the peak moved. */
+:root {
+  color-scheme: light;
+  --surface-1:      #fcfcfb;
+  --page:           #f9f9f7;
+  --text-primary:   #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted:     #898781;
+  --hairline:       #e1e0d9;
+  --axis:           #c3c2b7;
+  --ring:           rgba(11, 11, 11, .10);
+  --causal:         #a65a00;
+  --e1: #86b6ef;  --e2: #5598e7;  --e3: #2a78d6;  --e4: #1c5cab;  --e5: #0d366b;
+  --on-e1: #0b0b0b; --on-e2: #0b0b0b; --on-e3: #ffffff; --on-e4: #ffffff; --on-e5: #ffffff;
+  --critical: #d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --page:           #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --hairline:       #2c2c2a;
+    --axis:           #383835;
+    --ring:           rgba(255, 255, 255, .10);
+    --causal:         #f0a84b;
+    --e1: #184f95;  --e2: #256abf;  --e3: #3987e5;  --e4: #6da7ec;  --e5: #b7d3f6;
+    --on-e1: #ffffff; --on-e2: #ffffff; --on-e3: #ffffff; --on-e4: #0b0b0b; --on-e5: #0b0b0b;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-1: #1a1a19; --page: #0d0d0d;
+  --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #898781;
+  --hairline: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,.10);
+  --causal: #f0a84b;
+  --e1: #184f95;  --e2: #256abf;  --e3: #3987e5;  --e4: #6da7ec;  --e5: #b7d3f6;
+  --on-e1: #ffffff; --on-e2: #ffffff; --on-e3: #ffffff; --on-e4: #0b0b0b; --on-e5: #0b0b0b;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--page); color: var(--text-primary);
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  display: flex; flex-direction: column;
+}
+
+/* ---- controls: one row above the chart ---- */
+header {
+  display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+  padding: 10px 16px; background: var(--surface-1);
+  border-bottom: 1px solid var(--hairline);
+}
+h1 { font-size: 13px; font-weight: 600; margin: 0; letter-spacing: .01em; }
+h1 span { color: var(--text-muted); font-weight: 400; }
+.ctl { display: flex; align-items: center; gap: 7px; color: var(--text-secondary); }
+.ctl label { white-space: nowrap; }
+input[type=range] { width: 130px; accent-color: var(--e3); }
+button {
+  font: inherit; color: var(--text-secondary); background: transparent;
+  border: 1px solid var(--axis); border-radius: 6px; padding: 3px 9px; cursor: pointer;
+}
+button:hover { color: var(--text-primary); border-color: var(--text-muted); }
+button[aria-pressed="true"] { color: var(--text-primary); border-color: var(--text-muted); background: var(--page); }
+.val { font-variant-numeric: tabular-nums; color: var(--text-primary); min-width: 34px; }
+.spacer { flex: 1; }
+.status { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.status.stale { color: var(--critical); }
+
+/* ---- legend: sequential scale ---- */
+.legend { display: flex; align-items: center; gap: 0; }
+.legend .cap { color: var(--text-muted); margin-right: 8px; }
+.legend i {
+  display: block; width: 30px; height: 9px; border-radius: 1px;
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+.legend .step { display: flex; flex-direction: column; align-items: center; gap: 3px; }
+.legend .step b { font-weight: 400; font-size: 10px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+
+/* ---- the diagram ---- */
+main { flex: 1; overflow: auto; position: relative; padding: 20px 24px 60px; }
+#stage { position: relative; }
+#edges { position: absolute; inset: 0; overflow: visible; pointer-events: none; }
+#edges path { fill: none; stroke: var(--axis); stroke-width: 1; }
+#edges path.causal { stroke: var(--causal); stroke-width: 1.5; stroke-dasharray: 5 4; }
+
+.node {
+  position: absolute; height: 26px; width: 208px;
+  display: flex; align-items: center; gap: 7px; padding: 0 8px;
+  border-radius: 5px; box-shadow: inset 0 0 0 1px var(--ring);
+  cursor: default; overflow: hidden; white-space: nowrap;
+}
+.node:focus-visible { outline: 2px solid var(--text-primary); outline-offset: 2px; }
+.node .n { font-variant-numeric: tabular-nums; font-weight: 600; font-size: 12px; }
+.node .t { overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
+.node .k { margin-left: auto; font-size: 10px; opacity: .75; font-variant-numeric: tabular-nums; }
+/* Emphasis, used exactly once: the single heaviest process on screen. */
+.node.hot { box-shadow: inset 0 0 0 1px var(--ring), 0 0 0 2px var(--page), 0 0 0 3px var(--text-primary); }
+/* the "via" crumb: what was collapsed out of this edge */
+.via {
+  position: absolute; height: 14px; font-size: 10px; color: var(--text-muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none;
+}
+.via.causal { color: var(--causal); font-weight: 600; }
+
+.db-links {
+  max-width: 1100px; margin: 0 0 18px; padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--causal) 45%, var(--hairline));
+  border-radius: 7px; background: var(--surface-1); color: var(--text-secondary);
+}
+.db-links .cap { color: var(--causal); font-weight: 600; margin-bottom: 3px; }
+.db-links .note { color: var(--text-muted); font-size: 11px; margin-bottom: 5px; }
+.db-links .link { font-family: ui-monospace, Menlo, monospace; font-size: 11px; padding-top: 2px; }
+
+/* ---- tooltip ---- */
+#tip {
+  position: fixed; z-index: 9; max-width: 430px; pointer-events: none; opacity: 0;
+  transition: opacity .09s; background: var(--surface-1); color: var(--text-primary);
+  border: 1px solid var(--hairline); border-radius: 7px; padding: 9px 11px;
+  box-shadow: 0 6px 22px rgba(0,0,0,.16);
+}
+#tip.on { opacity: 1; }
+#tip .big { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+#tip .lbl { color: var(--text-secondary); }
+#tip dl { display: grid; grid-template-columns: auto 1fr; gap: 1px 12px; margin: 7px 0 0; }
+#tip dt { color: var(--text-muted); }
+#tip dd { margin: 0; font-variant-numeric: tabular-nums; }
+/* Agent command lines carry multi-kilobyte JSON settings blobs. Clamp, or one
+   hover buries the whole diagram; the table view keeps the full string. */
+#tip .cmd {
+  margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--hairline);
+  font-family: ui-monospace, Menlo, monospace; font-size: 10.5px;
+  color: var(--text-secondary); word-break: break-all;
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
+}
+
+/* ---- table view ---- */
+table { border-collapse: collapse; width: 100%; max-width: 1100px; }
+caption { text-align: left; color: var(--text-muted); padding-bottom: 8px; }
+th, td { text-align: left; padding: 5px 12px 5px 0; border-bottom: 1px solid var(--hairline); }
+th { color: var(--text-muted); font-weight: 500; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; padding-right: 20px; }
+/* Chromium command lines run to several hundred characters; two clamped lines
+   identify the process, and the full string is on the cell's title. */
+td.cmd {
+  font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--text-secondary);
+  max-width: 460px; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+[hidden] { display: none !important; }
+.empty { color: var(--text-muted); padding: 40px 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>energy&#8209;manager <span>· call graph</span></h1>
+
+  <div class="ctl">
+    <label for="min">Hide below</label>
+    <input id="min" type="range" min="0" max="30" step="0.1" value="0.1">
+    <span class="val" id="minv">0.1%</span>
+  </div>
+
+  <div class="ctl">
+    <button id="plumb" aria-pressed="false" title="Show the idle shell wrappers that are normally collapsed into the edge label">Wrappers</button>
+    <button id="pause" aria-pressed="false">Pause</button>
+    <button id="asTable" aria-pressed="false">Table</button>
+  </div>
+
+  <div class="legend" id="legend" aria-hidden="true"><span class="cap">%cpu, 10&#8209;min avg</span></div>
+
+  <div class="spacer"></div>
+  <div class="status" id="status">loading…</div>
+</header>
+
+<main>
+  <div id="dbLinks" class="db-links" hidden></div>
+  <div id="stage">
+    <svg id="edges" aria-hidden="true"></svg>
+  </div>
+  <div id="tableWrap" hidden></div>
+  <p class="empty" id="empty" hidden></p>
+</main>
+
+<div id="tip" role="tooltip" aria-live="polite"></div>
+
+<script>
+"use strict";
+// Absolute colour bins, in %cpu. Absolute (not peak-relative) so a process keeps its
+// colour across refreshes and threshold changes; the legend below is therefore a
+// fixed reference the reader can learn once.
+const BINS = [1, 3, 10, 30];              // < 1 | 1–3 | 3–10 | 10–30 | >= 30
+const BIN_LABEL = ["<1", "1–3", "3–10", "10–30", "≥30"];
+const COL_W = 366, NODE_W = 208, ROW_H = 32, ROOT_GAP = 22;
+
+const $ = (id) => document.getElementById(id);
+const stage = $("stage"), edges = $("edges"), tip = $("tip");
+let paused = false, tableMode = false, plumbing = false, timer = null, lastData = null;
+
+function bin(v) { let i = 0; while (i < BINS.length && v >= BINS[i]) i++; return i; }
+
+(function buildLegend() {
+  const el = $("legend");
+  BIN_LABEL.forEach((txt, i) => {
+    const step = document.createElement("span");
+    step.className = "step";
+    const sw = document.createElement("i");
+    sw.style.background = `var(--e${i + 1})`;
+    const cap = document.createElement("b");
+    cap.textContent = txt;                       // labels are data-adjacent: textContent only
+    step.append(sw, cap);
+    el.append(step);
+  });
+})();
+
+async function load() {
+  const min = parseFloat($("min").value);
+  try {
+    const r = await fetch(`/data.json?min=${min}&plumbing=${plumbing ? 1 : 0}`, { cache: "no-store" });
+    lastData = await r.json();
+    render(lastData);
+  } catch (e) {
+    $("status").textContent = "viewer lost the server";
+    $("status").classList.add("stale");
+  }
+}
+
+function setStatus(d) {
+  const s = $("status");
+  const age = d.sample_age;
+  // The plugin is the sampler. If nobody has sampled recently these averages are not
+  // "now", and saying so is the whole difference between a monitor and a screenshot.
+  if (age === null || age > 45) {
+    s.textContent = age === null ? "no samples — is SwiftBar running?"
+                                 : `stale: last sample ${Math.round(age)}s ago — is SwiftBar running?`;
+    s.classList.add("stale");
+  } else {
+    s.classList.remove("stale");
+    s.textContent = `${d.nodes.length} processes · ${d.total}% total · sampled ${Math.round(age)}s ago`;
+  }
+}
+
+/* Tidy-tree layout: x is depth, y is assigned by walking leaves in order and giving
+   each internal node the midpoint of its children. Children arrive already sorted
+   heaviest-first from lib/tree.awk, so the top edge of every fan is the hot path. */
+function layout(nodes, links) {
+  const kids = new Map(), byPid = new Map(), displayParent = new Map();
+  nodes.forEach((n) => byPid.set(n.pid, n));
+  nodes.forEach((n) => displayParent.set(n.pid, n.parent));
+
+  // A sole, unambiguous host client may pull the Docker root beneath itself for
+  // layout only. Real parent fields, subtree totals, and kill semantics remain
+  // untouched. Multiple clients stay as separate candidates in the attribution box.
+  const incoming = new Map(), causalByChild = new Map();
+  (links || []).forEach((l) => {
+    if (!incoming.has(l.target)) incoming.set(l.target, []);
+    incoming.get(l.target).push(l);
+  });
+  incoming.forEach((group, target) => {
+    const sources = [...new Set(group.map((l) => l.source).filter((p) => byPid.has(p)))];
+    if (!byPid.has(target) || sources.length !== 1 || !group.every((l) => l.candidates === 1)) return;
+    const source = sources[0];
+    let p = source, cycle = false;
+    for (let i = 0; i < 64 && p; i++) {
+      if (p === target) { cycle = true; break; }
+      p = displayParent.get(p);
+    }
+    if (cycle) return;
+    displayParent.set(target, source);
+    causalByChild.set(target, group);
+  });
+
+  nodes.forEach((n) => {
+    const parent = displayParent.get(n.pid);
+    if (!parent) return;
+    if (!kids.has(parent)) kids.set(parent, []);
+    kids.get(parent).push(n);
+  });
+  const roots = nodes.filter((n) => {
+    const parent = displayParent.get(n.pid);
+    return !parent || !byPid.has(parent);
+  });
+  let row = 0;
+  const place = (n, depth) => {
+    n.x = depth * COL_W;
+    const ch = kids.get(n.pid) || [];
+    if (!ch.length) { n.y = row++ * ROW_H; return; }
+    ch.forEach((c) => place(c, depth + 1));
+    n.y = (ch[0].y + ch[ch.length - 1].y) / 2;
+  };
+  roots.forEach((r) => { place(r, 0); row += ROOT_GAP / ROW_H + 1; });
+  return { roots, kids, causalByChild };
+}
+
+function render(d) {
+  setStatus(d);
+  const nodes = d.nodes;
+  const links = d.links || [];
+  renderDbLinks(links);
+  $("empty").hidden = nodes.length > 0;
+  if (!nodes.length) {
+    $("empty").textContent = "Nothing above this threshold. Drag “Hide below” to the left.";
+    stage.querySelectorAll(".node,.via").forEach((n) => n.remove());
+    edges.innerHTML = "";
+    return;
+  }
+  const { kids, causalByChild } = layout(nodes, links);
+  if (tableMode) { renderTable(nodes, links); return; }
+
+  stage.querySelectorAll(".node,.via").forEach((n) => n.remove());
+  edges.innerHTML = "";
+  let maxX = 0, maxY = 0;
+
+  for (const n of nodes) {
+    maxX = Math.max(maxX, n.x + NODE_W); maxY = Math.max(maxY, n.y + ROW_H);
+    const el = document.createElement("div");
+    el.className = "node" + (n.self === d.peak && d.peak > 0 ? " hot" : "");
+    el.style.left = n.x + "px";
+    el.style.top = n.y + "px";
+    const b = bin(n.sub);
+    el.style.background = `var(--e${b + 1})`;
+    el.style.color = `var(--on-e${b + 1})`;
+    el.tabIndex = 0;
+
+    const num = document.createElement("span");
+    num.className = "n"; num.textContent = n.sub.toFixed(1);
+    const txt = document.createElement("span");
+    txt.className = "t"; txt.textContent = n.label;     // untrusted: never innerHTML
+    el.append(num, txt);
+    const ch = kids.get(n.pid) || [];
+    if (n.sub > n.self + 0.05) {
+      const k = document.createElement("span");
+      k.className = "k"; k.textContent = "own " + n.self.toFixed(1);
+      el.append(k);
+    }
+    el.addEventListener("pointerenter", (ev) => showTip(n, ev));
+    el.addEventListener("pointermove", (ev) => moveTip(ev));
+    el.addEventListener("pointerleave", hideTip);
+    el.addEventListener("focus", () => showTipAt(n, el));
+    el.addEventListener("blur", hideTip);
+    stage.append(el);
+
+    for (const c of ch) {
+      const x1 = n.x + NODE_W, y1 = n.y + ROW_H / 2 - 3;
+      const x2 = c.x, y2 = c.y + ROW_H / 2 - 3;
+      const mid = x1 + (x2 - x1) / 2;
+      const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      p.setAttribute("d", `M${x1},${y1} C${mid},${y1} ${mid},${y2} ${x2},${y2}`);
+      const causal = causalByChild.get(c.pid);
+      if (causal) p.classList.add("causal");
+      else if (c.via) p.setAttribute("stroke-dasharray", "3 3"); // collapsed process hops
+      edges.append(p);
+      if (c.via || causal) {
+        const v = document.createElement("div");
+        v.className = "via" + (causal ? " causal" : "");
+        v.style.left = (x1 + 10) + "px";
+        v.style.top = (y2 - 13) + "px";
+        v.style.width = (COL_W - NODE_W - 22) + "px";
+        if (causal) {
+          const names = [...new Set(causal.map((l) => `${l.database} · ${l.container}`))];
+          v.textContent = "DB client ⇢ " + names.join(", ");
+        } else {
+          v.textContent = "via " + c.via;
+        }
+        stage.append(v);
+      }
+    }
+  }
+  stage.style.height = (maxY + 20) + "px";
+  stage.style.width = (maxX + 20) + "px";
+  edges.setAttribute("width", maxX + 20);
+  edges.setAttribute("height", maxY + 20);
+}
+
+function chainOf(n) {
+  const by = new Map(lastData.nodes.map((x) => [x.pid, x]));
+  const parts = [];
+  let p = n.parent;
+  for (let i = 0; i < 40 && p && by.has(p); i++) { parts.unshift(by.get(p).label); p = by.get(p).parent; }
+  return parts.join(" › ");
+}
+
+function dbRelation(n) {
+  const links = (lastData && lastData.links) || [];
+  const drives = links.filter((l) => l.source === n.pid);
+  const driven = links.filter((l) => l.target === n.pid);
+  const parts = [];
+  if (drives.length) {
+    const names = [...new Set(drives.map((l) => `${l.database} · ${l.container} :${l.port}`))];
+    parts.push("DB client for " + names.join(", "));
+  }
+  if (driven.length) {
+    const chains = [...new Set(driven.map((l) => l.chain))];
+    parts.push("DB clients: " + chains.join("; "));
+  }
+  return parts.join(" · ");
+}
+
+// Plain-English names for lib/tree.awk's attribution sources, strongest first.
+const ATTRIBUTION = {
+  stamp:       "launch stamp (browser-stamp)",
+  memory:      "remembered parent (witnessed)",
+  env:         "inherited environment",
+  responsible: "macOS responsible process",
+  pgid:        "process group",
+  cmux:        "cmux fallback (coarsest)",
+};
+
+function tipHTML(n) {
+  tip.textContent = "";
+  const head = document.createElement("div");
+  const big = document.createElement("span");
+  big.className = "big"; big.textContent = n.sub.toFixed(1) + "%";
+  const lbl = document.createElement("span");
+  lbl.className = "lbl"; lbl.textContent = "  " + n.label;
+  head.append(big, lbl);
+  const dl = document.createElement("dl");
+  const row = (k, v) => {
+    if (v === "" || v == null) return;
+    const dt = document.createElement("dt"); dt.textContent = k;
+    const dd = document.createElement("dd"); dd.textContent = v;
+    dl.append(dt, dd);
+  };
+  row("now, with children", n.sub_now.toFixed(1) + "%");
+  row("own, avg", n.self.toFixed(1) + "%");
+  row("own, now", n.self_now.toFixed(1) + "%");
+  row("pid", n.pid);
+  // macOS reparented this node to launchd, so the edge above it was reconstructed
+  // rather than read. Say which evidence produced it: a diagram that quietly guesses
+  // is worse than one that shows its working.
+  row("attributed by", ATTRIBUTION[n.attributed] || n.attributed);
+  row("agent session", n.session);
+  row("called by", chainOf(n) || "— top level —");
+  row("database link", dbRelation(n));
+  if (n.via) row("through", n.via);
+  const cmd = document.createElement("div");
+  cmd.className = "cmd"; cmd.textContent = n.cmd; cmd.title = n.cmd;
+  tip.append(head, dl, cmd);
+}
+function showTip(n, ev) { tipHTML(n); tip.classList.add("on"); moveTip(ev); }
+function showTipAt(n, el) {
+  tipHTML(n); tip.classList.add("on");
+  const r = el.getBoundingClientRect();
+  place(r.right + 12, r.top);
+}
+function moveTip(ev) { place(ev.clientX + 16, ev.clientY + 16); }
+function place(x, y) {
+  const r = tip.getBoundingClientRect();
+  tip.style.left = Math.min(x, innerWidth - r.width - 10) + "px";
+  tip.style.top = Math.min(y, innerHeight - r.height - 10) + "px";
+}
+function hideTip() { tip.classList.remove("on"); }
+
+/* The table is the accessibility path and the search path: everything the diagram
+   encodes as position and colour, as sortable text. */
+function renderTable(nodes, links) {
+  const wrap = $("tableWrap");
+  wrap.textContent = "";
+  const t = document.createElement("table");
+  const cap = document.createElement("caption");
+  cap.textContent = "Every process above the threshold, heaviest branch first. Causal DB links do not change branch totals.";
+  const thead = document.createElement("thead");
+  const hr = document.createElement("tr");
+  ["with children", "now", "own", "own now", "process", "called by", "DB relation", "pid", "command"].forEach((h, i) => {
+    const th = document.createElement("th");
+    th.textContent = h;
+    if (i < 4) th.style.textAlign = "right";
+    hr.append(th);
+  });
+  thead.append(hr);
+  const tb = document.createElement("tbody");
+  [...nodes].sort((a, b) => b.sub - a.sub).forEach((n) => {
+    const tr = document.createElement("tr");
+    const add = (v, cls) => {
+      const td = document.createElement("td");
+      td.textContent = v;                              // untrusted: never innerHTML
+      if (cls) td.className = cls;
+      if (cls === "cmd") td.title = v;                 // clamped in view, whole string on hover
+      tr.append(td);
+    };
+    add(n.sub.toFixed(1), "num"); add(n.sub_now.toFixed(1), "num");
+    add(n.self.toFixed(1), "num"); add(n.self_now.toFixed(1), "num");
+    add(n.label); add(chainOf(n) || "—"); add(dbRelation(n)); add(n.pid, "num"); add(n.cmd, "cmd");
+    tb.append(tr);
+  });
+  t.append(cap, thead, tb);
+  wrap.append(t);
+}
+
+function renderDbLinks(links) {
+  const box = $("dbLinks");
+  box.textContent = "";
+  box.hidden = !links.length;
+  if (!links.length) return;
+
+  const cap = document.createElement("div");
+  cap.className = "cap"; cap.textContent = "Docker database attribution";
+  const note = document.createElement("div");
+  note.className = "note";
+  note.textContent = "Dashed links are causal socket evidence. Docker CPU is not added to the caller’s process total.";
+  box.append(cap, note);
+
+  const groups = new Map();
+  links.forEach((l) => {
+    const key = `${l.target}\u0000${l.container_id}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(l);
+  });
+  groups.forEach((group) => {
+    const first = group[0];
+    const chains = [...new Set(group.map((l) => l.chain))];
+    const row = document.createElement("div");
+    row.className = "link";
+    const certainty = first.candidates === 1 ? "DB client" : `${first.candidates} possible host clients`;
+    row.textContent = `${first.database} · ${first.container} :${first.port} — ${certainty}: ${chains.join("; ")}`;
+    box.append(row);
+  });
+}
+
+function setMode() {
+  $("stage").hidden = tableMode;
+  $("tableWrap").hidden = !tableMode;
+  if (lastData) render(lastData);
+}
+
+$("min").addEventListener("input", (e) => {
+  $("minv").textContent = parseFloat(e.target.value).toFixed(1) + "%";
+});
+$("min").addEventListener("change", load);
+$("pause").addEventListener("click", (e) => {
+  paused = !paused;
+  e.target.setAttribute("aria-pressed", String(paused));
+  e.target.textContent = paused ? "Resume" : "Pause";
+});
+$("asTable").addEventListener("click", (e) => {
+  tableMode = !tableMode;
+  e.target.setAttribute("aria-pressed", String(tableMode));
+  e.target.textContent = tableMode ? "Diagram" : "Table";
+  setMode();
+});
+$("plumb").addEventListener("click", (e) => {
+  plumbing = !plumbing;
+  e.target.setAttribute("aria-pressed", String(plumbing));
+  load();
+});
+
+load();
+timer = setInterval(() => { if (!paused) load(); }, 5000);
+</script>
+</body>
+</html>

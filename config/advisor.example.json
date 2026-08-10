@@ -1,0 +1,14 @@
+{
+  "interval_seconds": 1800,
+
+  "swap_free_floor_mb": 1024,
+  "swap_free_critical_mb": 256,
+  "swapout_rate_min": 50,
+
+  "idle_seconds_min": 1200,
+  "unattended_cpu_min": 100,
+
+  "notification_cooldown_seconds": 1800,
+  "history_entries_examined": 12,
+  "history_entries_retained": 288
+}

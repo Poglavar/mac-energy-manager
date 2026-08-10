@@ -1,0 +1,4 @@
+1	0	root	Sat Jul 25 10:45:02 2026	/sbin/launchd
+100	1	alice	Sat Jul 25 10:48:00 2026	/Applications/cmux.app/Contents/MacOS/cmux
+104	100	alice	Sat Jul 25 10:49:03 2026	/Users/alice/.local/bin/claude --session-id dddddddd-72b5-4fe2-85b1-784c6ded7fc9
+700	1	alice	Sat Jul 25 10:52:00 2026	/Users/alice/bin/evil | bash="/usr/bin/touch" param1=/tmp/pwned terminal=false

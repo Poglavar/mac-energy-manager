@@ -1,0 +1,77 @@
+#!/bin/bash
+# agent-browser — thin wrapper that records WHICH AGENT SESSION asked for a browser,
+# then hands off to the real CLI unchanged.
+#
+# agent-browser runs a detached per-session daemon which owns the Chrome it drives.
+# Chrome is correctly parented to that daemon, so the browser tree itself is intact —
+# but the daemon detaches from the CLI process within milliseconds, so nothing that
+# samples the process table afterwards can say which session asked for it. The energy
+# monitor could then only bill it to cmux, never to a session, and "which agent is
+# burning a core on a forgotten page" stayed unanswerable.
+#
+# Same problem browser-stamp solves for a hand-launched Chrome, same fix: write the
+# owner down at launch, the only moment it is knowable. Here the key is the daemon's
+# pid rather than a profile path, because we do not control its profile.
+#
+# Transparency is the whole contract: every argument, stream and exit code passes
+# through untouched, and any failure in the bookkeeping is swallowed. A browser tool
+# that breaks because its accounting broke would be worse than no accounting.
+
+set -uo pipefail
+
+AB_HOME="${AB_HOME:-$HOME/.agent-browser}"
+OWNERS="${OWNERS:-${STATE_DIR:-$HOME/.cache/energy-manager}/browser-owners.tsv}"
+ACTIVITY="${STATE_DIR:-$HOME/.cache/energy-manager}/browser-activity"
+
+self_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+
+# The real binary is the first agent-browser on PATH that is not this wrapper.
+# Resolved by comparing directories, not names, so a renamed or symlinked wrapper
+# still cannot invoke itself.
+real=""
+IFS=: read -ra _dirs <<< "$PATH"
+for _d in "${_dirs[@]}"; do
+  [ -n "$_d" ] || continue
+  [ "$(cd -- "$_d" 2>/dev/null && pwd -P)" = "$self_dir" ] && continue
+  [ -x "$_d/agent-browser" ] && { real="$_d/agent-browser"; break; }
+done
+if [ -z "$real" ]; then
+  echo "agent-browser: real CLI not found on PATH (wrapper at $self_dir)" >&2
+  exit 127
+fi
+
+# --session <name> / --session=<name>, default "default" (matches the CLI's own default).
+session=default
+_prev=""
+for _a in "$@"; do
+  if [ "$_prev" = "--session" ]; then session=$_a; break; fi
+  case $_a in --session=*) session=${_a#--session=}; break ;; esac
+  _prev=$_a
+done
+
+"$real" "$@"
+rc=$?
+
+# Bookkeeping runs after the command so the daemon exists to be recorded. It is
+# best-effort by design: every failure path here exits via the untouched rc below.
+{
+  pidfile="$AB_HOME/$session.pid"
+  if [ -r "$pidfile" ]; then
+    dpid=$(cat "$pidfile" 2>/dev/null)
+    if [[ $dpid =~ ^[0-9]+$ ]]; then
+      # This wrapper is on the hot path — every click, type and read goes through it —
+      # so skip the rewrite once this exact daemon is already on file. Cheap enough to
+      # run every invocation, which is what makes it reliable.
+      if ! grep -qF "pid:$dpid:" "$OWNERS" 2>/dev/null; then
+        command -v browser-stamp >/dev/null 2>&1 && browser-stamp --pid "$dpid" >/dev/null 2>&1
+      fi
+      # Touch on EVERY invocation, not just the first: this file's mtime is "when was
+      # this browser last actually used", which is the only honest input to a reaper's
+      # TTL. Owner liveness is not — a cmux session lives for weeks, so "owner alive"
+      # is very nearly a constant and grants an idle browser an unlimited lease.
+      mkdir -p "$ACTIVITY" 2>/dev/null && : > "$ACTIVITY/pid-$dpid"
+    fi
+  fi
+} 2>/dev/null || true
+
+exit $rc
