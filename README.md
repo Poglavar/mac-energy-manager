@@ -1,3 +1,5 @@
+NOTE: this file has been AI-generated from the code. This is a simple tool allowing you to trace back energy spend to agent sessions causing it.
+
 # mac-energy-manager
 
 **A macOS menu-bar monitor that tells you *which process* is draining the battery — and
