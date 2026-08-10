@@ -88,10 +88,16 @@ actions, because they're different intentions rather than an escalation: **Cance
 turn (Ctrl-C)** leaves it running, **Quit agent** ends it. Quiet agents are hidden — an
 open session waiting on you costs nothing, and a wall of `0.0%` rows buries the busy one.
 
-**Chrome** — heavy renderer/GPU processes of the browser *you* launched (killing a
-renderer is safe: "Aw, Snap", then the tab reloads with its state), plus open tabs by
-title with **Close tab** once Automation permission is granted. Other Chromium browsers
-(Brave, Edge, VS Code's Electron) appear in Top consumers with helpers named by role.
+**Chrome** — heavy renderer/GPU processes of the browser *you* launched. **Stop this tab**
+ends a renderer: safe ("Aw, Snap", then the tab reloads with its state), and it is also how
+you learn *which* tab it was. GPU and utility processes offer **Restart this service**
+instead — they are shared, and the browser replaces them within milliseconds, so the click
+clears a wedged service but cannot reduce load: the demand lives in the tabs. For the same
+reason a shared service is never named as a tree's hotspot while any real culprit exists.
+Open tabs are listed by title with **Close tab** once Automation permission is granted,
+though titles cannot be matched to pids — see [design notes](docs/design-notes.md). Other
+Chromium browsers (Brave, Edge, VS Code's Electron) appear in Top consumers with helpers
+named by role.
 
 **Automation browsers** — see below.
 

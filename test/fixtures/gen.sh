@@ -140,3 +140,22 @@ cat > daemon-browser.energy.tsv <<EOF
 904${t}10.0${t}10.0
 EOF
 : > daemon-browser.parents.tsv
+
+# gpuhot — a browser whose GPU service outweighs every renderer, which is the ordinary
+# shape of a stuck tab (measured on a real machine: gpu 84.3%, top renderer 48.9%). The
+# hotspot slot must still name the renderer, because the GPU process is shared, is
+# respawned within milliseconds of being killed, and is never the cause of its own load.
+cat > gpuhot.procs.tsv <<EOF
+1${t}0${t}root${t}Sat Jul 25 10:45:02 2026${t}/sbin/launchd
+200${t}1${t}alice${t}Sat Jul 25 10:47:00 2026${t}/Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+201${t}200${t}alice${t}Sat Jul 25 10:47:10 2026${t}/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=renderer
+202${t}200${t}alice${t}Sat Jul 25 10:47:11 2026${t}/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=gpu-process
+203${t}200${t}alice${t}Sat Jul 25 10:47:12 2026${t}/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=utility --utility-sub-type=network.mojom.NetworkService
+EOF
+cat > gpuhot.energy.tsv <<EOF
+200${t}0.5${t}0.2
+201${t}40.0${t}38.0
+202${t}90.0${t}96.0
+203${t}5.0${t}4.0
+EOF
+: > gpuhot.parents.tsv

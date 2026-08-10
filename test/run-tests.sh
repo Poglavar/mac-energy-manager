@@ -452,6 +452,47 @@ kill -0 "$STUBBORN" 2>/dev/null && bad "a process ignoring SIGTERM is escalated 
   || ok "a process ignoring SIGTERM is escalated to SIGKILL"
 kill -9 "$STUBBORN" 2>/dev/null; rm -f "$STUB"
 
+echo "== shared browser services never take the hotspot slot =="
+# The GPU process is where every tab's work lands, so it routinely outweighs any single
+# renderer (real measurement: 84.3% vs 48.9%). Naming it as the hotspot points the user at
+# the one process that cannot be the cause: it is shared, and the browser respawns it
+# within milliseconds of a kill. The renderer must win the slot even at less than half
+# the cost, and the services must still be reported behind it.
+GH=$(tree gpuhot -v me=alice -v allow='Chrome')
+HOTS=$(printf '%s\n' "$GH" | awk -F'\t' '$1=="H"{print $4}' | tr '\n' ' ')
+is "the renderer wins the hotspot slot over a 2.25x heavier GPU service" \
+   "Chrome tab Chrome GPU Chrome utility " "$HOTS"
+is "the consumer's '→' would name the tab" \
+   "Chrome tab" "$(printf '%s\n' "$GH" | awk -F'\t' '$1=="H"{print $4; exit}')"
+has "the GPU service is still reported, with its real cost" \
+    '^H\t202\t90\.0\tChrome GPU' "$GH"
+
+echo "== an ungranted Chrome asks for permission, not for it back =="
+# The tab-name gate is a marker file, and the guards around it used a bare "return",
+# which propagates the guard's OWN status. With the caller now reading that status as
+# "the permission was withdrawn", a never-granted install would accuse macOS of revoking
+# a grant it never had. Needs a real Chrome, so it skips rather than lies on CI.
+if pgrep -x "Google Chrome" >/dev/null 2>&1; then
+  # First render on an empty state dir has no prior sample and reports "collecting…",
+  # so prime the history before asserting on the Chrome section.
+  STATE_DIR="$TMPD/fresh" bash plugins/energy.10s.sh >/dev/null 2>&1
+  FRESH=$(STATE_DIR="$TMPD/fresh" bash plugins/energy.10s.sh 2>/dev/null)
+  has  "a first run offers the enable prompt"        'Enable tab names' "$FRESH"
+  hasnt "a first run claims nothing was withdrawn"   'withdrew Automation' "$FRESH"
+
+  # Automation is granted per calling app, so this suite is refused where SwiftBar is
+  # allowed. A run outside SwiftBar must therefore never retract the marker — otherwise
+  # running the tests, or the plugin by hand once, silently destroys the user's grant.
+  mkdir -p "$TMPD/granted"; touch "$TMPD/granted/chrome-ok"
+  STATE_DIR="$TMPD/granted" bash plugins/energy.10s.sh >/dev/null 2>&1
+  STATE_DIR="$TMPD/granted" bash plugins/energy.10s.sh >/dev/null 2>&1
+  [ -f "$TMPD/granted/chrome-ok" ] \
+    && ok "a run outside SwiftBar leaves the Automation grant alone" \
+    || bad "a run outside SwiftBar leaves the Automation grant alone" "marker kept" "marker deleted"
+else
+  echo "  skip Google Chrome is not running"
+fi
+
 echo
 if [ "$FAIL" -gt 0 ]; then echo "FAILED: $FAIL failed, $PASS passed"; exit 1; fi
 echo "PASSED: $PASS assertions"

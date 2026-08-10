@@ -199,8 +199,20 @@ function subpids(p,   i, n, a, s) {
   return s p
 }
 
+# A browser's GPU / network / storage service is where every tab's work LANDS, not what
+# causes it. It is shared, so its cost is the sum of other processes' demands, and it is
+# supervised, so killing it accomplishes nothing — the parent respawns it in milliseconds
+# (measured: a Chrome gpu-process was replaced 2s after SIGTERM, back at the same load).
+# Naming one in the "→" slot answers "what is burning this?" with the one process the
+# answer can never be. They are still reported, just behind any real culprit.
+function shared_service(p) {
+  return (CMD[p] ~ /--type=(gpu-process|utility|zygote|broker|ppapi)/)
+}
+
 function hotspots(root, p,   i, n, a) {
-  if (p != root && SA[p] >= hog_min) HS[++HSN] = p
+  if (p != root && SA[p] >= hog_min) {
+    if (shared_service(p)) HG[++HGN] = p; else HS[++HSN] = p
+  }
   n = split(KIDS[p], a, " ")
   for (i = 1; i <= n; i++) hotspots(root, a[i])
 }
@@ -290,11 +302,17 @@ END {
     for (p in SRC) if (p in ALIVE && rootof(p) == r)
       printf "A\t%s\t%s\t%s\t%s\n", p, SRC[p], PP[p], ATSID[p]
 
-    HSN = 0; hotspots(r, r)
-    sortdesc(HS, HSN, "self")
+    HSN = 0; HGN = 0; hotspots(r, r)
+    sortdesc(HS, HSN, "self"); sortdesc(HG, HGN, "self")
+    # Shared services appended after the real culprits: the consumer takes the FIRST H
+    # record for the row's "→", so this hands that slot to something you can act on
+    # while still reporting the service if it is all there is.
+    for (j = 1; j <= HGN; j++) HS[HSN + j] = HG[j]
+    HSN += HGN
     for (j = 1; j <= HSN && j <= 3; j++)
       printf "H\t%s\t%.1f\t%s\t%s\n", HS[j], SA[HS[j]], lab(HS[j]), chainof(r, HS[j])
     for (j in HS) delete HS[j]
+    for (j in HG) delete HG[j]
 
     # Row budget: raise the visibility threshold until the tree fits. Beats truncating,
     # which would silently drop branches and leave dangling children.

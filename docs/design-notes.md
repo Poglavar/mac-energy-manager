@@ -190,6 +190,42 @@ all work exactly this way.
 The wait is bounded and polled every 100 ms, so the overwhelming majority of stops still
 complete in about 20 ms; only a process that actually ignores SIGTERM pays the full 2.5 s.
 
+**A supervised child is not a stoppable process.** A browser's GPU, network and storage
+services are *shared*: their cost is the sum of every tab's demand, and the browser process
+supervises them, so a kill is undone before the menu can redraw. Measured on a real Chrome:
+`SIGTERM` to a gpu-process at 110% CPU, and 2 s later a new gpu-process at 106%. The button
+had worked perfectly and looked completely broken, because the row said "Stop process" —
+the same words as on a renderer, where a kill really does stick.
+
+Two consequences, both in the code:
+
+- Renderers get **Stop this tab**; services get **Restart this service** plus a line saying
+  the browser respawns it at once. Killing a wedged GPU process is a real remedy, so the
+  action stays — it just no longer promises to reduce load.
+- `hotspots()` in `lib/tree.awk` never lets a shared service take a tree's `→` slot while a
+  non-service candidate exists, even a much cheaper one. Naming the GPU process answers
+  "what is burning this?" with the one process that cannot be the cause. Services are still
+  reported, with their real cost, behind the culprits.
+
+**Why the tool cannot name the tab that is burning your CPU.** It is asked constantly, and
+the honest answer is that the mapping does not exist outside the browser. A renderer's argv
+carries only `--renderer-client-id`, an internal counter; its open files are fonts, ICU data
+and dyld; renderers own no sockets, because the network service does. Chrome's AppleScript
+dictionary gives a tab's title, URL and loading flag — no pid and no cost. So the menu can
+list tabs by name and it can rank processes by cost, but joining the two would require a
+debug port on your real profile (which would hand every local process your logged-in
+sessions) or a browser extension. Both are worse than the problem. What *does* identify a
+tab is stopping its renderer: the tab visibly breaks, and reloads when you return to it.
+
+**Automation permission is per calling app**, which makes the marker file subtle. The same
+`osascript` SwiftBar is allowed to run is refused with `-1743` from a terminal, from the
+test suite, or over ssh. So a failure only means the grant is gone when the failure happens
+under SwiftBar; anywhere else it says nothing, and retracting the marker would let a single
+hand-run destroy a working setup. The grant is also not permanent — revoking it in System
+Settings leaves the marker behind, and this tool then believed tab listing worked for
+eighteen days while rendering an empty "Tabs" heading, with the re-enable prompt unreachable
+because the marker was still there. Trust the marker, but let SwiftBar revalidate it.
+
 **Coding agents keep two items**, because there the pair is not an escalation but two
 different intentions: SIGINT is Ctrl-C, which cancels the current turn and leaves the
 agent running, while quitting ends the session. Collapsing those would silently kill an

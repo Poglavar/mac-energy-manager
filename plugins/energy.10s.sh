@@ -255,8 +255,10 @@ collect_chrome() { awk -f "$REPO/lib/chrome.awk" "$ENERGY" "$PROCS"; }
 # menu bar item (verified empirically 2026-07-02). So renders never call osascript
 # unless the permission has been proven good, and even then a 3s alarm caps it.
 collect_chrome_tabs() {
-  pgrep -x "Google Chrome" >/dev/null 2>&1 || return
-  [ -f "$STATE_DIR/chrome-ok" ] || return
+  # Explicit 0: a bare "return" propagates the guard's own failure, and the caller now
+  # reads the status as "the permission is gone" and retracts the marker.
+  pgrep -x "Google Chrome" >/dev/null 2>&1 || return 0
+  [ -f "$STATE_DIR/chrome-ok" ] || return 0
   {
     perl -e 'alarm 3; exec @ARGV' osascript <<'AS'
 tell application "Google Chrome"
@@ -596,20 +598,62 @@ if pgrep -x "Google Chrome" >/dev/null 2>&1; then
   # "black,white" = light,dark theme pair (reads as default text in both).
   echo "Chrome | color=black,white"
   CHROME="$(collect_chrome)"
-  echo "-- Heavy processes, avg 10m (kill = tab reloads on revisit) | size=11 color=gray"
+  echo "-- Heavy processes, avg 10m | size=11 color=gray"
   printf '%s\n' "$CHROME" | awk -F'\t' '$1=="H"{print $2"\t"$3"\t"$4}' \
     | sort -t"$(printf '\t')" -k2 -rn | head -8 | while IFS=$'\t' read -r pid cpu type; do
     [ -z "$pid" ] && continue
     echo "-- ${cpu}  $type  pid $pid | font=Menlo color=black,white"
-    echo "---- Stop process | bash=\"$SELF\" param1=stop param3=$pid terminal=false keepopen=true refresh=true color=red"
+    # A renderer is a tab and stays dead until you revisit it, so stopping one both ends
+    # the drain and shows you WHICH tab it was. gpu/utility are shared services under the
+    # browser process, which replaces them within milliseconds — the click is not useless
+    # (it is the standard way to clear a wedged GPU process) but it does not reduce load,
+    # because the demand lives in the renderers. Labelling both "Stop process" made a
+    # working button look broken.
+    case "$type" in
+      tab)
+        echo "---- Stop this tab | bash=\"$SELF\" param1=stop param3=$pid terminal=false keepopen=true refresh=true color=red"
+        echo "---- the tab breaks — that is how you spot it — and reloads when revisited | size=10 color=gray"
+        ;;
+      *)
+        echo "---- Restart this service | bash=\"$SELF\" param1=stop param3=$pid terminal=false keepopen=true refresh=true color=red"
+        echo "---- shared — Chrome respawns it at once; the load is the tabs' | size=10 color=gray"
+        ;;
+    esac
   done
   nauto=$(printf '%s\n' "$CHROME" | awk -F'\t' '$1=="A"{print $2}')
   if [ "${nauto:-0}" -gt 0 ]; then
     echo "-- ⚙ $nauto automation-driven Chrome — see the section below | size=10 color=gray"
   fi
+  # The marker is proof the grant worked ONCE, not that it still holds. Revoking Automation
+  # in System Settings (or reinstalling Chrome) leaves it behind, and osascript then fails
+  # with -1743 on every render. Trusting it blindly is not hypothetical: on this machine a
+  # Jul-23 marker outlived its permission and the menu showed an empty "Tabs" heading for
+  # eighteen days, with the re-enable prompt unreachable because the marker was still there.
+  # So capture the status — a pipe would discard it — and let a failure retract the marker.
+  # ...but only SwiftBar's own verdict counts. Automation is granted per CALLING app, so
+  # the same osascript that SwiftBar is allowed to run is refused (-1743) from a terminal,
+  # a test, or an ssh session. Retracting on any failure would let one manual run destroy a
+  # perfectly good grant. Under SwiftBar a failure is authoritative; elsewhere it says
+  # nothing about the permission, so the marker is left exactly as it is.
+  CHROME_TABS=""; CHROME_TABS_RC=0
   if [ -f "$STATE_DIR/chrome-ok" ]; then
-    echo "-- Tabs | size=11 color=gray"
-    collect_chrome_tabs | while IFS='|' read -r wi ti title; do
+    CHROME_TABS=$(collect_chrome_tabs); CHROME_TABS_RC=$?
+    if [ "$CHROME_TABS_RC" -ne 0 ] && [ -n "${SWIFTBAR:-}" ]; then
+      rm -f "$STATE_DIR/chrome-ok"
+    fi
+  fi
+  if [ -f "$STATE_DIR/chrome-ok" ] && [ "$CHROME_TABS_RC" -ne 0 ]; then
+    # Marker intact, call refused: a hand-run outside SwiftBar. Say so, rather than print
+    # an empty "Tabs" heading and let it read as "you have no tabs".
+    echo "-- Tabs — unavailable outside SwiftBar (Automation is granted per app) | size=11 color=gray"
+  elif [ -f "$STATE_DIR/chrome-ok" ]; then
+    # Deliberately NOT presented as ranked. Chrome's AppleScript dictionary exposes a tab's
+    # title, URL and loading flag — no pid, no cost — and nothing outside the browser closes
+    # that gap: a renderer's argv carries only an internal --renderer-client-id, and its open
+    # files are fonts and ICU data (both checked). So this names tabs, it cannot rank them;
+    # implying otherwise would be a guess dressed as a diagnosis.
+    echo "-- Tabs — all of them; cost above is per-pid and cannot be matched to a title | size=11 color=gray"
+    printf '%s\n' "$CHROME_TABS" | while IFS='|' read -r wi ti title; do
       [ -z "$wi" ] && continue
       # A page title may contain a newline, which turns into an extra line here and would
       # otherwise put attacker text where a window index belongs. Drop such rows.
@@ -617,9 +661,13 @@ if pgrep -x "Google Chrome" >/dev/null 2>&1; then
       echo "-- $(trunc "$title" 38) | length=40 color=black,white"
       echo "---- Close tab | bash=\"$SELF\" param1=chrome-close param2=$wi param3=$ti terminal=false refresh=true color=red"
     done
+  elif [ "$CHROME_TABS_RC" -ne 0 ]; then
+    echo "-- ▸ Re-enable tab names… | bash=\"$SELF\" param1=chrome-enable terminal=false keepopen=true refresh=true"
+    echo "-- macOS withdrew Automation permission for Chrome | size=10 color=gray"
   else
-    echo "-- Enable Chrome tab listing… | bash=\"$SELF\" param1=chrome-enable terminal=false refresh=true"
-    echo "-- (approve the Automation prompt, then click again) | size=10 color=gray"
+    echo "-- ▸ Enable tab names… | bash=\"$SELF\" param1=chrome-enable terminal=false keepopen=true refresh=true"
+    echo "-- approve the Automation prompt, then click again | size=10 color=gray"
+    echo "-- until then the rows above can only be pids | size=10 color=gray"
   fi
 else
   echo "Chrome — not running | color=gray"
