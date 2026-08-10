@@ -163,11 +163,64 @@ die_bad_arg() { echo "energy: refusing $1" >&2; exit 2; }
 is_pid()  { case "$1" in ''|*[!0-9]*) return 1 ;; *) [ "$1" -gt 0 ] && [ "$1" -le 4194304 ] ;; esac; }
 is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
+# Percent-encode one value of the swiftbar://notify query. A process chooses its own
+# name, so an unencoded one could carry "&body=" and rewrite the notification, or a
+# newline and truncate it. Byte-wise under LC_ALL=C, because slicing UTF-8 by character
+# and taking "'$c" sign-extends anything above 0x7F into %FFFFFFFFFFFFFFC3.
+urlenc() (
+  export LC_ALL=C
+  local s=$1 out= c n i
+  for (( i = 0; i < ${#s}; i++ )); do
+    c=${s:i:1}
+    case $c in
+      [a-zA-Z0-9.~_-]) out+=$c ;;
+      *) printf -v n '%d' "'$c"; printf -v c '%%%02X' "$(( n & 0xFF ))"; out+=$c ;;
+    esac
+  done
+  printf '%s' "$out"
+)
+
+# Ephemeral feedback for a click whose effect is otherwise invisible. SwiftBar closes the
+# menu when a bash= row runs, and a stop can spend 2.5s escalating, so without this the
+# button looks like it did nothing — which is exactly how a working Stop got reported as
+# broken. Posted through SwiftBar rather than osascript: an osascript notification belongs
+# to Script Editor, so clicking it launches Script Editor (see post_notification in
+# lib/advisor.py). Backgrounded and never awaited — feedback must not delay the signal.
+em_notify() {  # $1=title  $2=body
+  [ -n "${EM_NO_NOTIFY:-}" ] && return 0
+  # Test seam: a banner cannot be asserted on, and silent feedback is the failure mode
+  # this whole change exists to prevent, so the tests need to read what would be posted.
+  if [ -n "${EM_NOTIFY_LOG:-}" ]; then
+    printf '%s\t%s\n' "$1" "$2" >> "$EM_NOTIFY_LOG"; return 0
+  fi
+  /usr/bin/open -g "swiftbar://notify?plugin=energy&title=$(urlenc "$1")&body=$(urlenc "$2")" \
+    >/dev/null 2>&1 &
+}
+
+# Name a pid the way the menu row named it, so the notification and the row agree. Note
+# the second -f: "awk -f lib/label.awk '{...}'" would treat the program as an INPUT FILE
+# and silently print nothing.
+em_label() {  # $1=pid
+  local c
+  c=$(ps -p "$1" -o command= 2>/dev/null) || return 1
+  [ -z "$c" ] && return 1
+  awk -v c="$c" -f "$REPO/lib/label.awk" -f <(printf 'BEGIN{print mklabel(c)}') </dev/null
+}
+
 case "$1" in
   act)            # $2=signal  $3=pid  -> send a signal to one pid
     case "$2" in TERM|KILL|INT) ;; *) die_bad_arg "signal $2" ;; esac
     is_pid "$3" || die_bad_arg "pid $3"
+    # Named before signalling, for the same reason as stop: afterwards there may be
+    # nothing left to read. SIGINT is a cancel, not a kill, so it must not say "quit".
+    act_label=$(em_label "$3") || act_label=""
+    [ -z "$act_label" ] && act_label="pid $3"
     kill -"$2" "$3" 2>/dev/null
+    if [ "$2" = INT ]; then
+      em_notify "Cancelled $act_label" "Ctrl-C sent. The session stays open."
+    else
+      em_notify "Quit $act_label" "The session was ended."
+    fi
     exit 0 ;;
   stop)           # $3=comma-separated pids, leaves first -> TERM, then KILL if needed
     # SIGTERM and SIGKILL were two menu items, which made the user perform the
@@ -181,16 +234,53 @@ case "$1" in
     # Leaves first, so a parent cannot respawn a child we already stopped.
     pids=$(printf '%s' "$3" | tr ',' ' ')
     for p in $pids; do is_pid "$p" || die_bad_arg "pid $p"; done
+    # Describe them while they still exist — after the signal there is nothing left to
+    # read. The list arrives leaves-first, so the LAST pid is the root of the tree and is
+    # the one worth naming.
+    n=0; last=""
+    for p in $pids; do n=$((n + 1)); last=$p; done
+    svc=0
+    if [ "$n" = 1 ]; then
+      case $(ps -p "$last" -o command= 2>/dev/null) in
+        *--type=gpu-process*|*--type=utility*|*--type=zygote*) svc=1 ;;
+      esac
+    fi
+    label=$(em_label "$last") || label=""
+    [ -z "$label" ] && label="pid $last"
+    [ "$n" -gt 1 ] && label="$label (+$((n - 1)))"
     for p in $pids; do kill -TERM "$p" 2>/dev/null; done
     # ~2.5s of patience in 100ms steps. Almost everything is gone within one step, so
     # the common case stays instant and only a stubborn process costs the full wait.
-    for _ in $(seq 1 "${EM_STOP_PATIENCE:-25}"); do
+    acked=0
+    for i in $(seq 1 "${EM_STOP_PATIENCE:-25}"); do
       alive=0
       for p in $pids; do kill -0 "$p" 2>/dev/null && alive=1; done
-      [ "$alive" = 0 ] && exit 0
+      if [ "$alive" = 0 ]; then
+        if [ "$svc" = 1 ]; then
+          em_notify "Restarted $label" "Shared service — the browser replaces it immediately. The load comes back with the tabs causing it."
+        elif [ "$n" -gt 1 ]; then
+          em_notify "Stopped $label" "$n processes, leaves first."
+        else
+          em_notify "Stopped $label" "pid $last stopped cleanly."
+        fi
+        exit 0
+      fi
+      # A stop that is going to take a while must still say it heard the click.
+      if [ "$acked" = 0 ] && [ "$i" -ge 3 ]; then
+        acked=1
+        em_notify "Stopping $label…" "Ignoring SIGTERM — waiting, then forcing."
+      fi
       sleep 0.1
     done
     for p in $pids; do kill -KILL "$p" 2>/dev/null; done
+    sleep 0.1
+    alive=0
+    for p in $pids; do kill -0 "$p" 2>/dev/null && alive=1; done
+    if [ "$alive" = 0 ]; then
+      em_notify "Force-stopped $label" "It ignored SIGTERM, so it was killed. Unsaved state was lost."
+    else
+      em_notify "Could not stop $label" "Still running after SIGKILL — it is probably not yours to signal."
+    fi
     exit 0 ;;
   plumbing)       # toggle showing the idle wrapper processes inside call trees
     mkdir -p "$STATE_DIR"
@@ -202,10 +292,20 @@ case "$1" in
     # page controls. Integers only, checked here and again where the row is rendered.
     is_uint "$2" || die_bad_arg "window index $2"
     is_uint "$3" || die_bad_arg "tab index $3"
-    osascript -e "tell application \"Google Chrome\" to close tab $3 of window $2" 2>/dev/null
+    if osascript -e "tell application \"Google Chrome\" to close tab $3 of window $2" 2>/dev/null; then
+      em_notify "Closed tab $3" "Window $2."
+    else
+      em_notify "Could not close tab $3" "Chrome refused, or the tab had already moved."
+    fi
     exit 0 ;;
   caffkill)       # kill every caffeinate keep-awake assertion
+    caff_n=$(pgrep -x caffeinate 2>/dev/null | grep -c .)
     pkill -x caffeinate 2>/dev/null
+    if [ "${caff_n:-0}" -gt 0 ]; then
+      em_notify "Released $caff_n keep-awake assertion(s)" "The Mac can idle-sleep again."
+    else
+      em_notify "No keep-awake assertions" "Nothing was holding the Mac awake."
+    fi
     exit 0 ;;
   open)           # $2=a System Settings pane
     # The menu only ever emits x-apple.systempreferences: URLs. Anything else — a file://

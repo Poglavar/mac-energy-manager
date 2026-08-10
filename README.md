@@ -82,6 +82,12 @@ if needed — the same contract as `docker stop`. The root also has **Stop whole
 which signals every pid leaves-first; otherwise you stop a parent, the children carry on,
 and the number you clicked doesn't go away.
 
+**Every action tells you what it did.** SwiftBar closes the menu the instant a row runs, so
+an action that stays silent is indistinguishable from one that did nothing. A clean stop
+posts one notification naming the process as the row named it; a stop that has to escalate
+acknowledges the click first and then reports the forced kill; stopping a shared browser
+service says **Restarted**, because that is what happened.
+
 **Coding agents** — any agent CLI running under your terminal (claude, codex, copilot,
 aider and anything else, found by walking the process tree rather than by name). Two
 actions, because they're different intentions rather than an escalation: **Cancel current

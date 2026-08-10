@@ -190,6 +190,28 @@ all work exactly this way.
 The wait is bounded and polled every 100 ms, so the overwhelming majority of stops still
 complete in about 20 ms; only a process that actually ignores SIGTERM pays the full 2.5 s.
 
+**A silent action is an action that did nothing.** SwiftBar closes the menu the moment a
+`bash=` row runs, and `keepopen=true` does not reliably prevent it, so the user is returned
+to the desktop with no evidence the click registered — while the escalation can still be
+running for 2.5 s. Combined with a target the browser respawns, that produced the exact
+report this section exists because of: "pressing stop doesn't work".
+
+Feedback goes through SwiftBar's own `swiftbar://notify`, not `osascript`: an osascript
+notification belongs to Script Editor, so clicking it launches Script Editor. The shape is
+chosen so the common case is not noisy — a clean stop is one notification, and a second one
+appears only when the stop is slow enough to need acknowledging:
+
+| outcome | notifications |
+|---|---|
+| stopped within 300 ms | one, `Stopped <label>` |
+| still alive at 300 ms | `Stopping <label>…`, then `Force-stopped` or `Could not stop` |
+| shared browser service | one, `Restarted <label>` — never "Stopped" |
+
+The label comes from the same `mklabel()` the menu row used, so the notification and the row
+cannot disagree. It is read *before* the signal, because afterwards there is nothing left to
+read. And it is percent-encoded on the way into the URL: a process chooses its own name, so
+an unencoded one could carry `&body=` and rewrite the notification it appears in.
+
 **A supervised child is not a stoppable process.** A browser's GPU, network and storage
 services are *shared*: their cost is the sum of every tab's demand, and the browser process
 supervises them, so a kill is undone before the menu can redraw. Measured on a real Chrome:

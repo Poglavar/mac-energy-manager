@@ -8,6 +8,12 @@ export LC_ALL=C LANG=C
 PASS=0; FAIL=0
 TMPD=$(mktemp -d); trap 'rm -rf "$TMPD"' EXIT
 
+# Every stop the suite performs would otherwise fire a real macOS banner. Routing them to
+# a file keeps the run silent AND makes the feedback assertable.
+export EM_NOTIFY_LOG="$TMPD/notify.log"; : > "$EM_NOTIFY_LOG"
+notices() { cat "$EM_NOTIFY_LOG" 2>/dev/null; }
+notices_reset() { : > "$EM_NOTIFY_LOG"; }
+
 # tree <fixture-prefix> [extra awk -v args...]
 tree() {
   local f=$1; shift
@@ -435,11 +441,20 @@ echo "== stopping a process =="
 # SIGTERM and SIGKILL were two menu items, which made the user perform the escalation by
 # hand. One action now does both in order. Tested by behaviour, not by grepping for the
 # signal name: what matters is that the process is gone either way.
+notices_reset
 sleep 30 & POLITE=$!; disown 2>/dev/null
 EM_STOP_PATIENCE=3 bash plugins/energy.10s.sh stop x "$POLITE" >/dev/null 2>&1
 sleep 0.2
 kill -0 "$POLITE" 2>/dev/null && bad "a well-behaved process stops on SIGTERM" "gone" "alive" \
   || ok "a well-behaved process stops on SIGTERM"
+
+# SwiftBar closes the menu the moment a bash= row runs, so a stop that says nothing is
+# indistinguishable from a stop that did nothing — the exact reading that got a working
+# button reported as broken. A clean stop reports once, and names the process the way the
+# row did rather than by pid.
+POLITE_NOTES=$(notices)
+is "a clean stop reports exactly once" "1" "$(printf '%s\n' "$POLITE_NOTES" | grep -c .)"
+has "and says what it stopped, by name" '^Stopped sleep\b' "$POLITE_NOTES"
 
 # A process that ignores SIGTERM is exactly why SIGKILL exists; the escalation must
 # reach it without the user choosing anything.
@@ -451,6 +466,32 @@ sleep 0.2
 kill -0 "$STUBBORN" 2>/dev/null && bad "a process ignoring SIGTERM is escalated to SIGKILL" "gone" "alive" \
   || ok "a process ignoring SIGTERM is escalated to SIGKILL"
 kill -9 "$STUBBORN" 2>/dev/null; rm -f "$STUB"
+
+# A stop that escalates can take 2.5s. It must acknowledge the click BEFORE that, then
+# report the outcome — and must not claim a clean stop when it had to force one.
+STUB_NOTES=$(notices)
+has  "a slow stop acknowledges the click first" '^Stopping ' "$STUB_NOTES"
+has  "and reports that it had to force the kill" '^Force-stopped ' "$STUB_NOTES"
+hasnt "and never calls a forced kill a clean stop" '^Stopped bash' "$STUB_NOTES"
+
+# The whole point of the gpu/utility split: stopping a shared service is not a stop, and
+# saying "Stopped" would repeat the lie the menu row used to tell.
+notices_reset
+GSTUB=$(mktemp -t emgpu); printf '#!/bin/bash\nwhile :; do sleep 1; done\n' > "$GSTUB"
+chmod +x "$GSTUB"; "$GSTUB" --type=gpu-process & GSVC=$!; disown 2>/dev/null
+sleep 0.3
+EM_STOP_PATIENCE=3 bash plugins/energy.10s.sh stop x "$GSVC" >/dev/null 2>&1
+GSVC_NOTES=$(notices)
+has  "stopping a shared service reports a restart, not a stop" '^Restarted ' "$GSVC_NOTES"
+has  "and says the load returns with the tabs" 'load comes back' "$GSVC_NOTES"
+kill -9 "$GSVC" 2>/dev/null; rm -f "$GSTUB"
+
+# A process names itself, so a name is untrusted input on its way into a URL query.
+# "&body=" must not be able to rewrite the notification it appears in.
+# Lifted out rather than sourced: sourcing the plugin renders a whole menu.
+ENC=$(bash -c 'eval "$(sed -n "/^urlenc() (/,/^)\$/p" plugins/energy.10s.sh)"; urlenc "evil&body=x ⚡"')
+is "a hostile process name cannot forge query parameters" \
+   "evil%26body%3Dx%20%E2%9A%A1" "$ENC"
 
 echo "== shared browser services never take the hotspot slot =="
 # The GPU process is where every tab's work lands, so it routinely outweighs any single
