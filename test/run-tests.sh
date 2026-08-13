@@ -538,9 +538,14 @@ has "and says what it stopped, by name" '^Stopped sleep\b' "$POLITE_NOTES"
 
 # A process that ignores SIGTERM is exactly why SIGKILL exists; the escalation must
 # reach it without the user choosing anything.
-STUB=$(mktemp -t emstub); printf '#!/bin/bash\ntrap "" TERM\nwhile :; do sleep 1; done\n' > "$STUB"
+STUB=$(mktemp -t emstub); STUBREADY="$TMPD/stub.ready"
+# The stub announces itself AFTER installing the trap. Sleeping a fixed 0.3s instead was
+# a race: under load the TERM arrived before the trap existed, the stub died to it, and
+# the escalation assertions failed for a reason that had nothing to do with the code.
+printf '#!/bin/bash\ntrap "" TERM\ntouch "%s"\nwhile :; do sleep 1; done\n' "$STUBREADY" > "$STUB"
 chmod +x "$STUB"; "$STUB" & STUBBORN=$!; disown 2>/dev/null
-sleep 0.3
+for _ in $(seq 1 200); do [ -f "$STUBREADY" ] && break; sleep 0.05; done
+[ -f "$STUBREADY" ] || bad "the stubborn stub started" "ready file" "never appeared"
 EM_STOP_PATIENCE=3 bash plugins/energy.10s.sh stop x "$STUBBORN" >/dev/null 2>&1
 sleep 0.2
 kill -0 "$STUBBORN" 2>/dev/null && bad "a process ignoring SIGTERM is escalated to SIGKILL" "gone" "alive" \
