@@ -614,7 +614,7 @@ if [ -n "$FLAGGED" ]; then
   printf '%s\n' "$FLAGGED" | while IFS=$'\t' read -r _ pid avg now nproc _ _ _ label _; do
     [ -z "$pid" ] && continue
     sub=""; [ "${nproc:-1}" -gt 1 ] && sub=" ($nproc)"
-    echo "$avg · $now  $(trunc "$label")$sub$(em_stop_tag "$pid") | color=orange font=Menlo size=12"
+    echo "$avg · $now  $(trunc "$label")$sub #$pid$(em_stop_tag "$pid") | color=orange font=Menlo size=12"
     if em_stopping "$pid"; then
       echo "-- Already stopping — force it now | bash=\"$SELF\" param1=act param2=KILL param3=$pid terminal=false keepopen=true refresh=true color=red"
     else
@@ -678,7 +678,11 @@ printf '%s\n' "$TREE" | awk -F'\t' -v self="$SELF" -v stopping="$STOPPING_CSV" '
       dbhot = ""
       if (dbn == 1 && DCAND[dbfirst] == 1) dbhot = "  ⇠ DB: " DSRCLAB[dbfirst]
       else if (dbn > 0) dbhot = sprintf("  ⇠ DB: %d possible clients", dbn)
-      row(sprintf("%s%-*.1f · %*.1f  %s%s%s%s%s", mark, NUMW, AVG[i], NUMW, NOW[i], LAB[i], grp, hot, dbhot, tag(ID[i])),
+      # The pid, on the row. Without it "did the one I stopped survive?" is unanswerable:
+      # Chrome replaces a killed renderer with a NEW process for the same tab, so an
+      # identical-looking row is usually a different pid, not a stop that failed.
+      # "#123" rather than "(123)" because "(74)" on this row already means 74 processes.
+      row(sprintf("%s%-*.1f · %*.1f  %s%s #%s%s%s%s", mark, NUMW, AVG[i], NUMW, NOW[i], LAB[i], grp, ID[i], hot, dbhot, tag(ID[i])),
           "font=Menlo size=12 length=52 color=" (FLAG[i] ? "orange" : "black,white"))
       if (CRIT[i]) {
         row("-- system process — not killable (shared by all apps)", "color=gray")
@@ -713,7 +717,7 @@ printf '%s\n' "$TREE" | awk -F'\t' -v self="$SELF" -v stopping="$STOPPING_CSV" '
       row("-- Totals include low-cost processes hidden by the row limit", "size=10 color=gray")
       for (j = 1; j <= t; j++) {
         if (TTREE[j] != i) continue
-        txt = sprintf("%-*.1f · %*.1f  %s%s%s%s%s", NUMW, TAVG[j], NUMW, TNOW[j], TPFX[j], TLAB[j],
+        txt = sprintf("%-*.1f · %*.1f  %s%s #%s%s%s%s", NUMW, TAVG[j], NUMW, TNOW[j], TPFX[j], TLAB[j], TPID[j],
                       (TAVG[j] > TSELFAVG[j] + 0.05 ? sprintf("   own %.1f · %.1f", TSELFAVG[j], TSELFNOW[j]) : ""),
                       (TVIA[j] == "" ? "" : "   ← " TVIA[j]), tag(TPID[j]))
         row("-- " txt, "font=Menlo size=12 length=64 color=" (THOG[j] == "1" ? "orange" : "black,white"))
@@ -754,7 +758,7 @@ else
   else
     printf '%s\n' "$BUSY" | head -"$AGENT_MAX" | while IFS=$'\t' read -r pid cpu label cmd; do
       [ -z "$pid" ] && continue
-      echo "${cpu}%  $label$(em_stop_tag "$pid") | font=Menlo size=12 color=black,white"
+      echo "${cpu}%  $label #$pid$(em_stop_tag "$pid") | font=Menlo size=12 color=black,white"
       echo "-- Cancel current turn (Ctrl-C) | bash=\"$SELF\" param1=act param2=INT param3=$pid terminal=false keepopen=true refresh=true"
       if em_stopping "$pid"; then
         echo "-- Already quitting — force it now | bash=\"$SELF\" param1=act param2=KILL param3=$pid terminal=false keepopen=true refresh=true color=red"
