@@ -471,6 +471,29 @@ STOPROWS=$(grep -c 'param1=stop param2=- param3=' plugins/energy.10s.sh || true)
 [ "$STOPROWS" -ge 8 ] && ok "every Stop row passes contiguous params ($STOPROWS)" \
   || bad "every Stop row passes contiguous params" ">= 8" "$STOPROWS"
 
+echo "== (stopped) tombstones =="
+# A stopped process leaves ps, so the menu simply stops showing it — which reads exactly
+# like a click that missed. A tombstone keeps the outcome where the action was taken.
+TOMBFUNCS='eval "$(sed -n "/^em_mark_stopped()/,/^}$/p;/^em_stopped_live()/,/^}$/p" plugins/energy.10s.sh)"'
+tombenv() { bash -c "STATE_DIR=$TMPD/tb; STOPPED=$TMPD/tb/stopped.tsv; STOPPED_TTL=\${TTL:-20}; mkdir -p \$STATE_DIR; $TOMBFUNCS"'; '"$1"; }
+
+DEADPID=$( (sleep 30 & echo $!) ); kill -9 "$DEADPID" 2>/dev/null; wait "$DEADPID" 2>/dev/null
+is "a stopped process is remembered with its label" "$DEADPID	sleep 30" \
+   "$(tombenv 'em_mark_stopped '"$DEADPID"' "sleep 30"; em_stopped_live' | cut -f1,3)"
+is "it is forgotten once the TTL passes" "" \
+   "$(TTL=0 tombenv 'em_mark_stopped '"$DEADPID"' x; sleep 1; em_stopped_live')"
+
+# Chrome replaces a killed renderer within a second. A tombstone sitting next to the live
+# replacement would claim a kill that did not stick, which is worse than showing nothing.
+sleep 30 & BACKPID=$!
+is "a pid that is alive again shows no tombstone" "" \
+   "$(tombenv 'em_mark_stopped '"$BACKPID"' "came back"; em_stopped_live')"
+kill -9 "$BACKPID" 2>/dev/null; wait "$BACKPID" 2>/dev/null
+
+# The label is a process name, i.e. attacker-controlled; a tab in it would split the record.
+is "a tab in the label cannot split the record" "1" \
+   "$(tombenv 'em_mark_stopped 999999 "a	b"; wc -l < $STOPPED' | tr -d ' ')"
+
 echo "== periodic advisor =="
 ADVOUT=$(python3 test/test_advisor.py 2>&1); ADVRC=$?
 [ "$ADVRC" -eq 0 ] && ok "sanitization, focus metadata, triggers, dedupe and launch-agent tests" \

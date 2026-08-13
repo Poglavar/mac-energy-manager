@@ -129,6 +129,12 @@ TABS="$STATE_DIR/cmux-tabs.tsv"         # agent session id -> the name you gave 
 # pid<TAB>start<TAB>signalled_epoch; start is carried because pids are reused.
 STOPPING="$STATE_DIR/stopping.tsv"
 STOPPING_TTL=${EM_STOPPING_TTL:-300}    # after this, stop claiming it is on its way out
+# And the other half: a process that IS gone leaves the menu entirely, so reopening it
+# shows no trace of what you just did — the row is simply absent, which reads the same as
+# a row that was never there. Keep a tombstone briefly so the outcome is visible where the
+# action was taken, not only in a banner that has already gone.
+STOPPED="$STATE_DIR/stopped.tsv"        # pid<TAB>stopped_epoch<TAB>label
+STOPPED_TTL=${EM_STOPPED_TTL:-20}       # long enough to reopen the menu and look
 # SAMPLING DESIGN: no `top`, no background collector. `top -l 2` takes ~2.2s (SwiftBar
 # times slow plugins out and never shows the icon) and HANGS without a tty, and SwiftBar
 # kills plugin-spawned children, so a collector can't live anywhere reliable. Instead,
@@ -243,6 +249,31 @@ em_stopping_live() {  # -> pids still on their way out, one per line
   mv "$tmp" "$STOPPING" 2>/dev/null || rm -f "$tmp"
 }
 
+em_mark_stopped() {  # $1=pid  $2=label as the row showed it
+  mkdir -p "$STATE_DIR"
+  # Tabs and newlines would split the record; the label comes from a process name, which
+  # is attacker-controlled (anything can exec with a chosen argv[0]).
+  printf '%s\t%s\t%s\n' "$1" "$(date +%s)" "$(printf '%s' "$2" | tr '\t\n' '  ')" >> "$STOPPED"
+}
+
+em_stopped_live() {  # -> pid<TAB>seconds-ago<TAB>label for the recently stopped
+  [ -s "$STOPPED" ] || return 0
+  local now tmp p ts lab age
+  now=$(date +%s); tmp="$STOPPED.$$"
+  : > "$tmp"
+  while IFS="$(printf '\t')" read -r p ts lab; do
+    [ -z "$p" ] && continue
+    age=$((now - ${ts:-0}))
+    [ "$age" -gt "$STOPPED_TTL" ] && continue
+    # It came back. Chrome respawns a renderer within a second of losing one, and a
+    # tombstone next to the live replacement would claim a kill that did not stick.
+    kill -0 "$p" 2>/dev/null && continue
+    printf '%s\t%s\t%s\n' "$p" "$ts" "$lab" >> "$tmp"
+    printf '%s\t%s\t%s\n' "$p" "$age" "$lab"
+  done < "$STOPPED"
+  mv "$tmp" "$STOPPED" 2>/dev/null || rm -f "$tmp"
+}
+
 # Name a pid the way the menu row named it, so the notification and the row agree. Note
 # the second -f: "awk -f lib/label.awk '{...}'" would treat the program as an INPUT FILE
 # and silently print nothing.
@@ -267,7 +298,15 @@ case "$1" in
     if [ "$2" = INT ]; then
       em_notify "Cancelled $act_label" "Ctrl-C sent. The session stays open."
     else
-      em_notify "Quit $act_label" "The session was ended."
+      # Say what happened, not what was attempted. This used to announce "The session was
+      # ended" without ever looking — the same class of lie as the empty-pid stop.
+      sleep 0.2
+      if kill -0 "$3" 2>/dev/null; then
+        em_notify "Could not quit $act_label" "Still running after SIG$2 — it is probably not yours to signal."
+      else
+        em_mark_stopped "$3" "$act_label"
+        em_notify "Quit $act_label" "The session was ended."
+      fi
     fi
     exit 0 ;;
   stop)           # $3=comma-separated pids, leaves first -> TERM, then KILL if needed
@@ -318,6 +357,7 @@ case "$1" in
       alive=0
       for p in $pids; do kill -0 "$p" 2>/dev/null && alive=1; done
       if [ "$alive" = 0 ]; then
+        em_mark_stopped "$last" "$label"
         if [ "$svc" = 1 ]; then
           em_notify "Restarted $label" "Shared service — the browser replaces it immediately. The load comes back with the tabs causing it."
         elif [ "$n" -gt 1 ]; then
@@ -339,6 +379,7 @@ case "$1" in
     alive=0
     for p in $pids; do kill -0 "$p" 2>/dev/null && alive=1; done
     if [ "$alive" = 0 ]; then
+      em_mark_stopped "$last" "$label"
       em_notify "Force-stopped $label" "It ignored SIGTERM, so it was killed. Unsaved state was lost."
     else
       em_notify "Could not stop $label" "Still running after SIGKILL — it is probably not yours to signal."
@@ -640,6 +681,15 @@ fi
 # One row per top-level process, carrying what it and everything it spawned cost
 # together; open a row to get the call tree that adds up to that number.
 echo "Top consumers, %cpu  (avg 10m · now) | size=11 color=gray"
+# Tombstones first, where the row you clicked used to be. A stopped process vanishes from
+# ps, so without this the menu shows nothing at all and a successful stop is
+# indistinguishable from a click that missed. Not struck through: this script runs under
+# LC_ALL=C, and inserting combining characters into a UTF-8 process name byte by byte
+# corrupts it. Grey, a ✕, and the word "stopped" say the same thing without that risk.
+em_stopped_live | while IFS="$(printf '\t')" read -r spid sage slab; do
+  [ -z "$spid" ] && continue
+  echo "✕ $(trunc "$slab" 40) #$spid — stopped ${sage}s ago | color=gray font=Menlo size=12"
+done
 printf '%s\n' "$TREE" | awk -F'\t' -v self="$SELF" -v stopping="$STOPPING_CSV" '
   # SwiftBar rows that only carry a submenu lose their action on an incremental menu
   # update unless they set a colour of their own, so every parent row below has one.
