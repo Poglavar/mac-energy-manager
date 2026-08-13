@@ -280,7 +280,18 @@ case "$1" in
     # So: ask nicely, wait, and insist only if asked nicely did not work — the same
     # contract as `docker stop`, systemd's TimeoutStopSec, and macOS logout.
     # Leaves first, so a parent cannot respawn a child we already stopped.
-    pids=$(printf '%s' "$3" | tr ',' ' ')
+    # $2 is an unused placeholder; the pids are $3. The menu rows used to omit param2
+    # entirely, and a row whose parameters are not contiguous does not arrive intact —
+    # param3 never reached the script, so $3 was empty. Every row now passes "param2=-".
+    pids=$(printf '%s' "${3:-}" | tr ',' ' ')
+    # An empty list must never reach the loop below: with nothing to check, "is anything
+    # still alive?" is false on the very first pass, so the action congratulates itself
+    # for a stop it never performed. That is exactly what happened — two clicks on a
+    # Chrome tab, two "stopped cleanly" notifications, and a process still at 83% cpu.
+    if [ -z "$(printf '%s' "$pids" | tr -d ' ')" ]; then
+      em_notify "Could not stop it" "The menu row carried no process id — refresh the menu and try again."
+      exit 1
+    fi
     for p in $pids; do is_pid "$p" || die_bad_arg "pid $p"; done
     # Describe them while they still exist — after the signal there is nothing left to
     # read. The list arrives leaves-first, so the LAST pid is the root of the tree and is
@@ -618,7 +629,7 @@ if [ -n "$FLAGGED" ]; then
     if em_stopping "$pid"; then
       echo "-- Already stopping — force it now | bash=\"$SELF\" param1=act param2=KILL param3=$pid terminal=false keepopen=true refresh=true color=red"
     else
-      echo "-- Stop | bash=\"$SELF\" param1=stop param3=$pid terminal=false keepopen=true refresh=true"
+      echo "-- Stop | bash=\"$SELF\" param1=stop param2=- param3=$pid terminal=false keepopen=true refresh=true"
     fi
   done
 else
@@ -695,10 +706,10 @@ printf '%s\n' "$TREE" | awk -F'\t' -v self="$SELF" -v stopping="$STOPPING_CSV" '
           row("-- Already stopping — force it now",
               "bash=\"" self "\" param1=act param2=KILL param3=" ID[i] " terminal=false keepopen=true refresh=true color=red")
         else
-          row("-- Stop", "bash=\"" self "\" param1=stop param3=" ID[i] " terminal=false keepopen=true refresh=true")
+          row("-- Stop", "bash=\"" self "\" param1=stop param2=- param3=" ID[i] " terminal=false keepopen=true refresh=true")
         if (KILL[i] != "") {
           row(sprintf("-- Stop whole tree (%d processes)", NP[i]),
-              "bash=\"" self "\" param1=stop param3=" KILL[i] " terminal=false keepopen=true refresh=true color=red")
+              "bash=\"" self "\" param1=stop param2=- param3=" KILL[i] " terminal=false keepopen=true refresh=true color=red")
         }
       }
       if (dbn > 0) {
@@ -725,7 +736,7 @@ printf '%s\n' "$TREE" | awk -F'\t' -v self="$SELF" -v stopping="$STOPPING_CSV" '
           row("---- Already stopping — force it now",
               "bash=\"" self "\" param1=act param2=KILL param3=" TPID[j] " terminal=false keepopen=true refresh=true color=red")
         else
-          row("---- Stop", "bash=\"" self "\" param1=stop param3=" TPID[j] " terminal=false keepopen=true refresh=true")
+          row("---- Stop", "bash=\"" self "\" param1=stop param2=- param3=" TPID[j] " terminal=false keepopen=true refresh=true")
         for (q = 1; q <= d; q++) if (DSOURCE[q] == TPID[j]) {
           maybe = (DCAND[q] > 1) ? sprintf("possible client, %d connected", DCAND[q]) : "DB client"
           row(sprintf("---- ⇢ Docker · %s · %s :%s  (%s)", DKIND[q], DCNAME[q], DPORT[q], maybe),
@@ -763,7 +774,7 @@ else
       if em_stopping "$pid"; then
         echo "-- Already quitting — force it now | bash=\"$SELF\" param1=act param2=KILL param3=$pid terminal=false keepopen=true refresh=true color=red"
       else
-        echo "-- Quit agent | bash=\"$SELF\" param1=stop param3=$pid terminal=false keepopen=true refresh=true color=red"
+        echo "-- Quit agent | bash=\"$SELF\" param1=stop param2=- param3=$pid terminal=false keepopen=true refresh=true color=red"
       fi
       echo "-- $(trunc "$cmd" 80) | font=Menlo size=10 color=gray"
     done
@@ -797,11 +808,11 @@ if pgrep -x "Google Chrome" >/dev/null 2>&1; then
     # working button look broken.
     case "$type" in
       tab)
-        echo "---- Stop this tab | bash=\"$SELF\" param1=stop param3=$pid terminal=false keepopen=true refresh=true color=red"
+        echo "---- Stop this tab | bash=\"$SELF\" param1=stop param2=- param3=$pid terminal=false keepopen=true refresh=true color=red"
         echo "---- the tab breaks — that is how you spot it — and reloads when revisited | size=10 color=gray"
         ;;
       *)
-        echo "---- Restart this service | bash=\"$SELF\" param1=stop param3=$pid terminal=false keepopen=true refresh=true color=red"
+        echo "---- Restart this service | bash=\"$SELF\" param1=stop param2=- param3=$pid terminal=false keepopen=true refresh=true color=red"
         echo "---- shared — Chrome respawns it at once; the load is the tabs' | size=10 color=gray"
         ;;
     esac
@@ -895,7 +906,7 @@ if [ -n "$AUTOB" ]; then
     else
       echo "-- (no debug port — pages unknown) | size=10 color=gray"
     fi
-    echo "-- Stop this browser | bash=\"$SELF\" param1=stop param3=$pids terminal=false keepopen=true refresh=true color=red"
+    echo "-- Stop this browser | bash=\"$SELF\" param1=stop param2=- param3=$pids terminal=false keepopen=true refresh=true color=red"
   done
 fi
 

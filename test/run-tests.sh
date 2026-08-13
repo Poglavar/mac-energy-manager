@@ -447,6 +447,30 @@ AWKTAG='function dying(pid) { return index(stopping, "," pid ",") > 0 }
 is "awk tags only the pids in the stopping set" "  · stopping…||1" \
    "$(awk -v stopping=",101,102," "$AWKTAG" </dev/null)"
 
+echo "== a stop that stops nothing must not claim success =="
+# Stop was the only action using non-contiguous params (param1 + param3, no param2), so
+# the pid never arrived. With an empty list the liveness loop asks "is anything still
+# alive?" about nothing, gets false on the first pass, and reports "stopped cleanly" —
+# twice in a row, on a process that kept running at 83% cpu.
+notices_reset
+EM_NOTIFY_LOG="$EM_NOTIFY_LOG" bash plugins/energy.10s.sh stop "" >/dev/null 2>&1
+EMPTYRC=$?
+[ "$EMPTYRC" -ne 0 ] && ok "an empty pid list is an error, not a success" \
+  || bad "an empty pid list is an error, not a success" "non-zero exit" "exit $EMPTYRC"
+hasnt "it never reports a clean stop it did not perform" 'Stopped' "$(notices)"
+has "it says what went wrong instead" 'Could not stop' "$(notices)"
+notices_reset
+
+# Every Stop row must carry a param2 placeholder. Without it SwiftBar has a hole at
+# param2 and param3 never arrives, which is the bug above — so guard the rows, not just
+# the handler. Checked against the rendering code, since the failure is invisible in a
+# rendered menu: the row looks perfectly well-formed either way.
+GAPPED=$(grep -c 'param1=stop param3=' plugins/energy.10s.sh || true)
+is "no Stop row skips param2" "0" "$GAPPED"
+STOPROWS=$(grep -c 'param1=stop param2=- param3=' plugins/energy.10s.sh || true)
+[ "$STOPROWS" -ge 8 ] && ok "every Stop row passes contiguous params ($STOPROWS)" \
+  || bad "every Stop row passes contiguous params" ">= 8" "$STOPROWS"
+
 echo "== periodic advisor =="
 ADVOUT=$(python3 test/test_advisor.py 2>&1); ADVRC=$?
 [ "$ADVRC" -eq 0 ] && ok "sanitization, focus metadata, triggers, dedupe and launch-agent tests" \
