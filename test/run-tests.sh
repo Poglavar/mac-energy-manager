@@ -8,6 +8,12 @@ export LC_ALL=C LANG=C
 PASS=0; FAIL=0
 TMPD=$(mktemp -d); trap 'rm -rf "$TMPD"' EXIT
 
+# The suite runs the real plugin, including its stop action, which writes to STATE_DIR.
+# Unset, that is ~/.cache/energy-manager — the live one — so a test run left tombstones
+# for its own fixtures sitting in the user's menu ("✕ bash GPU #62335 — stopped 20s ago").
+# Tests must never write where the running app reads.
+export STATE_DIR="$TMPD/state"; mkdir -p "$STATE_DIR"
+
 # Every stop the suite performs would otherwise fire a real macOS banner. Routing them to
 # a file keeps the run silent AND makes the feedback assertable.
 export EM_NOTIFY_LOG="$TMPD/notify.log"; : > "$EM_NOTIFY_LOG"
