@@ -414,6 +414,39 @@ is "a page is reported with its profile, title and url" \
    "/tmp/prof-1	Build dashboard	http://localhost:8080/station.html" "$CDPOUT"
 hasnt "non-page targets are not listed as tabs" 'service worker' "$CDPOUT"
 
+echo "== stopping… (a signalled process must not look untouched) =="
+# A stop notifies immediately and closes the menu, but the process can take seconds to go.
+# Reopening the menu then shows a row identical to one never signalled, and it gets
+# stopped again. These guard the state that stops that happening — with a real process,
+# because the whole mechanism is about liveness.
+STOPFUNCS='eval "$(sed -n "/^em_pid_start()/,/^}$/p;/^em_mark_stopping()/,/^}$/p;/^em_stopping_live()/,/^}$/p" plugins/energy.10s.sh)"'
+stopenv() { bash -c "STATE_DIR=$TMPD/st; STOPPING=$TMPD/st/stopping.tsv; STOPPING_TTL=\${TTL:-300}; mkdir -p \$STATE_DIR; $STOPFUNCS"'; '"$1"; }
+
+sleep 30 & LIVEPID=$!
+is "a signalled process is listed while it is still alive" "$LIVEPID" \
+   "$(stopenv 'em_mark_stopping '"$LIVEPID"'; em_stopping_live')"
+is "listing it twice does not duplicate the row" "$LIVEPID" \
+   "$(stopenv 'em_mark_stopping '"$LIVEPID"'; em_stopping_live >/dev/null; em_stopping_live')"
+kill -9 "$LIVEPID" 2>/dev/null; wait "$LIVEPID" 2>/dev/null
+is "once it exits it stops being listed" "" \
+   "$(stopenv 'em_stopping_live')"
+
+# Pids are reused. Without the start-time check a recycled pid inherits "stopping…" and
+# the row lies about a process nobody touched.
+sleep 30 & REUSED=$!
+is "a pid whose start time no longer matches is not listed" "" \
+   "$(stopenv 'printf "%s\t%s\t%s\n" '"$REUSED"' NOT_THE_SAME_START $(date +%s) > $STOPPING; em_stopping_live')"
+is "an entry older than the TTL is forgotten" "" \
+   "$(TTL=1 stopenv 'em_mark_stopping '"$REUSED"'; sed -i.bak "s/\t[0-9]*$/\t1/" $STOPPING; em_stopping_live')"
+kill -9 "$REUSED" 2>/dev/null; wait "$REUSED" 2>/dev/null
+
+# The awk half of the same test: rows and their actions both have to react.
+AWKTAG='function dying(pid) { return index(stopping, "," pid ",") > 0 }
+        function tag(pid) { return dying(pid) ? "  · stopping…" : "" }
+        BEGIN { printf "%s|%s|%d\n", tag(101), tag(999), dying(101) }'
+is "awk tags only the pids in the stopping set" "  · stopping…||1" \
+   "$(awk -v stopping=",101,102," "$AWKTAG" </dev/null)"
+
 echo "== periodic advisor =="
 ADVOUT=$(python3 test/test_advisor.py 2>&1); ADVRC=$?
 [ "$ADVRC" -eq 0 ] && ok "sanitization, focus metadata, triggers, dedupe and launch-agent tests" \

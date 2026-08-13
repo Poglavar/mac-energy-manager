@@ -123,6 +123,12 @@ SNAP_T="$STATE_DIR/cputime.epoch"  # when that snapshot was taken
 PLUMB_FILE="$STATE_DIR/plumbing" # "1" = show every link in the chain, wrappers included
 OWNERS="$STATE_DIR/browser-owners.tsv"  # automation browser -> who launched it (bin/browser-stamp)
 TABS="$STATE_DIR/cmux-tabs.tsv"         # agent session id -> the name you gave that cmux tab
+# Processes that have been signalled but have not exited yet. A stop notifies immediately
+# and the menu closes, so the next time the menu opens a still-dying process looks exactly
+# like one that was never signalled — and gets stopped again. Rows for these say so.
+# pid<TAB>start<TAB>signalled_epoch; start is carried because pids are reused.
+STOPPING="$STATE_DIR/stopping.tsv"
+STOPPING_TTL=${EM_STOPPING_TTL:-300}    # after this, stop claiming it is on its way out
 # SAMPLING DESIGN: no `top`, no background collector. `top -l 2` takes ~2.2s (SwiftBar
 # times slow plugins out and never shows the icon) and HANGS without a tty, and SwiftBar
 # kills plugin-spawned children, so a collector can't live anywhere reliable. Instead,
@@ -197,6 +203,46 @@ em_notify() {  # $1=title  $2=body
     >/dev/null 2>&1 &
 }
 
+# A pid on its own is not an identity: pids are reused, and a recycled one must not
+# inherit the previous tenant's "stopping…". Pair it with the start time, which is stable
+# for the life of the process and changes the moment the number is handed to someone else.
+em_pid_start() {  # $1=pid -> opaque start-time token, empty if the pid is gone
+  ps -p "$1" -o lstart= 2>/dev/null | tr -s ' ' '_'
+}
+
+em_mark_stopping() {  # $@=pids just signalled
+  mkdir -p "$STATE_DIR"
+  local now st p
+  now=$(date +%s)
+  for p in "$@"; do
+    st=$(em_pid_start "$p")
+    [ -z "$st" ] && continue
+    printf '%s\t%s\t%s\n' "$p" "$st" "$now" >> "$STOPPING"
+  done
+}
+
+# Prunes as it reads, so the file can only shrink: a process that has exited, been
+# replaced by a new one on the same pid, or outlived the TTL simply stops being listed.
+em_stopping_live() {  # -> pids still on their way out, one per line
+  [ -s "$STOPPING" ] || return 0
+  local now tmp p st ts seen=" "
+  now=$(date +%s); tmp="$STOPPING.$$"
+  : > "$tmp"
+  while IFS="$(printf '\t')" read -r p st ts; do
+    [ -z "$p" ] && continue
+    # Stopping the same process twice appends twice, so collapse here rather than at the
+    # call sites: the file is what grows, and a duplicate row would be reported twice.
+    case "$seen" in *" $p "*) continue ;; esac
+    [ $((now - ${ts:-0})) -gt "$STOPPING_TTL" ] && continue
+    kill -0 "$p" 2>/dev/null || continue
+    [ "$(em_pid_start "$p")" = "$st" ] || continue
+    seen="$seen$p "
+    printf '%s\t%s\t%s\n' "$p" "$st" "$ts" >> "$tmp"
+    printf '%s\n' "$p"
+  done < "$STOPPING"
+  mv "$tmp" "$STOPPING" 2>/dev/null || rm -f "$tmp"
+}
+
 # Name a pid the way the menu row named it, so the notification and the row agree. Note
 # the second -f: "awk -f lib/label.awk '{...}'" would treat the program as an INPUT FILE
 # and silently print nothing.
@@ -215,6 +261,8 @@ case "$1" in
     # nothing left to read. SIGINT is a cancel, not a kill, so it must not say "quit".
     act_label=$(em_label "$3") || act_label=""
     [ -z "$act_label" ] && act_label="pid $3"
+    # SIGINT is a cancel — the process is meant to survive it, so it is not "stopping".
+    [ "$2" = INT ] || em_mark_stopping "$3"
     kill -"$2" "$3" 2>/dev/null
     if [ "$2" = INT ]; then
       em_notify "Cancelled $act_label" "Ctrl-C sent. The session stays open."
@@ -248,6 +296,9 @@ case "$1" in
     label=$(em_label "$last") || label=""
     [ -z "$label" ] && label="pid $last"
     [ "$n" -gt 1 ] && label="$label (+$((n - 1)))"
+    # Marked before the signal, not after: the escalation below can take 2.5s, and a menu
+    # opened during it must already know these are on their way out.
+    em_mark_stopping $pids
     for p in $pids; do kill -TERM "$p" 2>/dev/null; done
     # ~2.5s of patience in 100ms steps. Almost everything is gone within one step, so
     # the common case stays instant and only a stubborn process costs the full wait.
@@ -540,6 +591,17 @@ if [ -s "$CUR" ]; then echo "⚡${TOPVAL:-0}${WARN}"; else echo "⚡…"; fi
 echo "---"
 [ -s "$CUR" ] || echo "collecting first sample… | color=gray size=11"
 
+# Read once per render, not per row: this prunes the file as a side effect, so calling it
+# repeatedly would have each caller racing the others to rewrite it.
+STOPPING_CSV=",$(em_stopping_live | sort -un | tr '\n' ',' )"
+# Rows are rendered by both shell and awk, so both need the same test.
+em_stopping() {  # $1=pid -> true when it has been signalled and is still here
+  case "$STOPPING_CSV" in *",$1,"*) return 0 ;; *) return 1 ;; esac
+}
+em_stop_tag() {  # $1=pid -> the suffix a row carries while it is dying
+  em_stopping "$1" && printf '  · stopping…'
+}
+
 # ---- Activity mode + incompatibility warnings -------------------------------
 echo "Mode: $MODE | size=11 color=black,white"
 for m in reading coding surfing; do
@@ -552,8 +614,12 @@ if [ -n "$FLAGGED" ]; then
   printf '%s\n' "$FLAGGED" | while IFS=$'\t' read -r _ pid avg now nproc _ _ _ label _; do
     [ -z "$pid" ] && continue
     sub=""; [ "${nproc:-1}" -gt 1 ] && sub=" ($nproc)"
-    echo "$avg · $now  $(trunc "$label")$sub | color=orange font=Menlo size=12"
-    echo "-- Stop | bash=\"$SELF\" param1=stop param3=$pid terminal=false keepopen=true refresh=true"
+    echo "$avg · $now  $(trunc "$label")$sub$(em_stop_tag "$pid") | color=orange font=Menlo size=12"
+    if em_stopping "$pid"; then
+      echo "-- Already stopping — force it now | bash=\"$SELF\" param1=act param2=KILL param3=$pid terminal=false keepopen=true refresh=true color=red"
+    else
+      echo "-- Stop | bash=\"$SELF\" param1=stop param3=$pid terminal=false keepopen=true refresh=true"
+    fi
   done
 else
   echo "✓ Nothing heavy conflicts with ‘$MODE’ | color=green size=11"
@@ -563,10 +629,14 @@ fi
 # One row per top-level process, carrying what it and everything it spawned cost
 # together; open a row to get the call tree that adds up to that number.
 echo "Top consumers, %cpu  (avg 10m · now) | size=11 color=gray"
-printf '%s\n' "$TREE" | awk -F'\t' -v self="$SELF" '
+printf '%s\n' "$TREE" | awk -F'\t' -v self="$SELF" -v stopping="$STOPPING_CSV" '
   # SwiftBar rows that only carry a submenu lose their action on an incremental menu
   # update unless they set a colour of their own, so every parent row below has one.
   function row(txt, params) { print txt " | " params }
+  # Signalled but still here. The row says so, and its action escalates instead of
+  # repeating a SIGTERM the process has already ignored.
+  function dying(pid) { return index(stopping, "," pid ",") > 0 }
+  function tag(pid) { return dying(pid) ? "  · stopping…" : "" }
   function widen(v, w) { w=length(sprintf("%.1f", v)); if (w > NUMW) NUMW=w }
   $1=="R" {
     n++; ID[n]=$2; AVG[n]=$3; NOW[n]=$4; NP[n]=$5
@@ -608,7 +678,7 @@ printf '%s\n' "$TREE" | awk -F'\t' -v self="$SELF" '
       dbhot = ""
       if (dbn == 1 && DCAND[dbfirst] == 1) dbhot = "  ⇠ DB: " DSRCLAB[dbfirst]
       else if (dbn > 0) dbhot = sprintf("  ⇠ DB: %d possible clients", dbn)
-      row(sprintf("%s%-*.1f · %*.1f  %s%s%s%s", mark, NUMW, AVG[i], NUMW, NOW[i], LAB[i], grp, hot, dbhot),
+      row(sprintf("%s%-*.1f · %*.1f  %s%s%s%s%s", mark, NUMW, AVG[i], NUMW, NOW[i], LAB[i], grp, hot, dbhot, tag(ID[i])),
           "font=Menlo size=12 length=52 color=" (FLAG[i] ? "orange" : "black,white"))
       if (CRIT[i]) {
         row("-- system process — not killable (shared by all apps)", "color=gray")
@@ -617,7 +687,11 @@ printf '%s\n' "$TREE" | awk -F'\t' -v self="$SELF" '
           row("-- (e.g. idle cmux tabs, video) or enabling Reduce Motion/Transparency.", "color=gray size=11")
         }
       } else {
-        row("-- Stop", "bash=\"" self "\" param1=stop param3=" ID[i] " terminal=false keepopen=true refresh=true")
+        if (dying(ID[i]))
+          row("-- Already stopping — force it now",
+              "bash=\"" self "\" param1=act param2=KILL param3=" ID[i] " terminal=false keepopen=true refresh=true color=red")
+        else
+          row("-- Stop", "bash=\"" self "\" param1=stop param3=" ID[i] " terminal=false keepopen=true refresh=true")
         if (KILL[i] != "") {
           row(sprintf("-- Stop whole tree (%d processes)", NP[i]),
               "bash=\"" self "\" param1=stop param3=" KILL[i] " terminal=false keepopen=true refresh=true color=red")
@@ -639,11 +713,15 @@ printf '%s\n' "$TREE" | awk -F'\t' -v self="$SELF" '
       row("-- Totals include low-cost processes hidden by the row limit", "size=10 color=gray")
       for (j = 1; j <= t; j++) {
         if (TTREE[j] != i) continue
-        txt = sprintf("%-*.1f · %*.1f  %s%s%s%s", NUMW, TAVG[j], NUMW, TNOW[j], TPFX[j], TLAB[j],
+        txt = sprintf("%-*.1f · %*.1f  %s%s%s%s%s", NUMW, TAVG[j], NUMW, TNOW[j], TPFX[j], TLAB[j],
                       (TAVG[j] > TSELFAVG[j] + 0.05 ? sprintf("   own %.1f · %.1f", TSELFAVG[j], TSELFNOW[j]) : ""),
-                      (TVIA[j] == "" ? "" : "   ← " TVIA[j]))
+                      (TVIA[j] == "" ? "" : "   ← " TVIA[j]), tag(TPID[j]))
         row("-- " txt, "font=Menlo size=12 length=64 color=" (THOG[j] == "1" ? "orange" : "black,white"))
-        row("---- Stop", "bash=\"" self "\" param1=stop param3=" TPID[j] " terminal=false keepopen=true refresh=true")
+        if (dying(TPID[j]))
+          row("---- Already stopping — force it now",
+              "bash=\"" self "\" param1=act param2=KILL param3=" TPID[j] " terminal=false keepopen=true refresh=true color=red")
+        else
+          row("---- Stop", "bash=\"" self "\" param1=stop param3=" TPID[j] " terminal=false keepopen=true refresh=true")
         for (q = 1; q <= d; q++) if (DSOURCE[q] == TPID[j]) {
           maybe = (DCAND[q] > 1) ? sprintf("possible client, %d connected", DCAND[q]) : "DB client"
           row(sprintf("---- ⇢ Docker · %s · %s :%s  (%s)", DKIND[q], DCNAME[q], DPORT[q], maybe),
@@ -676,9 +754,13 @@ else
   else
     printf '%s\n' "$BUSY" | head -"$AGENT_MAX" | while IFS=$'\t' read -r pid cpu label cmd; do
       [ -z "$pid" ] && continue
-      echo "${cpu}%  $label | font=Menlo size=12 color=black,white"
+      echo "${cpu}%  $label$(em_stop_tag "$pid") | font=Menlo size=12 color=black,white"
       echo "-- Cancel current turn (Ctrl-C) | bash=\"$SELF\" param1=act param2=INT param3=$pid terminal=false keepopen=true refresh=true"
-      echo "-- Quit agent | bash=\"$SELF\" param1=stop param3=$pid terminal=false keepopen=true refresh=true color=red"
+      if em_stopping "$pid"; then
+        echo "-- Already quitting — force it now | bash=\"$SELF\" param1=act param2=KILL param3=$pid terminal=false keepopen=true refresh=true color=red"
+      else
+        echo "-- Quit agent | bash=\"$SELF\" param1=stop param3=$pid terminal=false keepopen=true refresh=true color=red"
+      fi
       echo "-- $(trunc "$cmd" 80) | font=Menlo size=10 color=gray"
     done
     nbusy=$(printf '%s\n' "$BUSY" | grep -c . || true)
