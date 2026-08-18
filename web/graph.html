@@ -163,6 +163,43 @@ td.cmd {
 }
 [hidden] { display: none !important; }
 .empty { color: var(--text-muted); padding: 40px 0; }
+
+/* ---- process list -------------------------------------------------------
+   The view the menu bar structurally cannot be: it stays open while you act, so a
+   stop can be watched landing instead of reported afterwards in a banner. */
+#procsWrap { overflow: auto; max-height: calc(100vh - 190px); max-width: 1100px; }
+#procsWrap table { width: 100%; max-width: none; font-size: 12px; }
+#procsWrap thead th {
+  position: sticky; top: 0; z-index: 1; background: var(--surface-1);
+  padding: 6px 10px 6px 0; white-space: nowrap;
+  border-bottom: 1px solid var(--hairline); cursor: pointer; user-select: none;
+}
+#procsWrap thead th.num { text-align: right; padding-right: 20px; }
+#procsWrap th .dir { color: var(--text-muted); }
+#procsWrap tbody tr:hover { background: var(--surface-1); }
+#procsWrap td.name { font-family: ui-monospace, Menlo, monospace; white-space: nowrap; }
+#procsWrap td.cmdcell {
+  color: var(--text-secondary); font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+  max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+#procsWrap td.owner { color: var(--text-secondary); font-size: 11px; white-space: nowrap; }
+#procsWrap button.stop { font-size: 11px; padding: 1px 9px; }
+#procsWrap button.stop:hover { color: var(--critical); border-color: var(--critical); }
+#procsWrap button.stop[disabled] { opacity: .5; cursor: default; }
+/* A row mid-stop, a row already gone, and an ordinary row must all look different.
+   Reusing --causal for "in flight" keeps this on the validated palette: it is the
+   colour this page already uses for "evidence, not yet a fact". */
+#procsWrap tr.stopping { color: var(--causal); }
+#procsWrap tr.stopped { color: var(--text-muted); text-decoration: line-through; }
+#procsWrap tr.failed { color: var(--critical); }
+#procsWrap .rowstate { font-size: 11px; text-decoration: none; display: inline-block; }
+.toolbar { display: flex; gap: 10px; align-items: center; margin: 0 0 10px; flex-wrap: wrap; }
+.toolbar input[type=search] {
+  font: inherit; font-size: 12px; padding: 3px 9px; min-width: 240px;
+  border-radius: 6px; border: 1px solid var(--axis);
+  background: transparent; color: var(--text-primary);
+}
+.toolbar .count { color: var(--text-muted); font-size: 11px; }
 </style>
 </head>
 <body>
@@ -180,6 +217,7 @@ td.cmd {
     <button id="plumb" aria-pressed="false" title="Show the idle shell wrappers that are normally collapsed into the edge label">Wrappers</button>
     <button id="pause" aria-pressed="false">Pause</button>
     <button id="asTable" aria-pressed="false">Table</button>
+    <button id="asProcs" aria-pressed="false">Processes</button>
   </div>
 
   <div class="legend" id="legend" aria-hidden="true"><span class="cap">%cpu, 10&#8209;min avg</span></div>
@@ -194,6 +232,14 @@ td.cmd {
     <svg id="edges" aria-hidden="true"></svg>
   </div>
   <div id="tableWrap" hidden></div>
+  <div id="procsPane" hidden>
+    <div class="toolbar">
+      <input id="q" type="search" placeholder="filter by name, pid or command…" autocomplete="off" spellcheck="false">
+      <span class="count" id="qcount"></span>
+      <span class="count" id="stopNote"></span>
+    </div>
+    <div id="procsWrap"></div>
+  </div>
   <p class="empty" id="empty" hidden></p>
 </main>
 
@@ -210,7 +256,9 @@ const COL_W = 366, NODE_W = 208, ROW_H = 32, ROOT_GAP = 22;
 
 const $ = (id) => document.getElementById(id);
 const stage = $("stage"), edges = $("edges"), tip = $("tip");
-let paused = false, tableMode = false, plumbing = false, timer = null, lastData = null;
+let paused = false, plumbing = false, timer = null, lastData = null;
+// "graph" | "table" | "procs". Was a tableMode boolean; a third view made it a lie.
+let view = "graph";
 
 function bin(v) { let i = 0; while (i < BINS.length && v >= BINS[i]) i++; return i; }
 
@@ -319,8 +367,9 @@ function render(d) {
     edges.innerHTML = "";
     return;
   }
+  if (view === "procs") { renderProcs(d); return; }
   const { kids, causalByChild } = layout(nodes, links);
-  if (tableMode) { renderTable(nodes, links); return; }
+  if (view === "table") { renderTable(nodes, links); return; }
 
   stage.querySelectorAll(".node,.via").forEach((n) => n.remove());
   edges.innerHTML = "";
@@ -532,9 +581,146 @@ function renderDbLinks(links) {
   });
 }
 
+/* ---- process list ------------------------------------------------------- */
+
+// Handed over only in the page this server itself served; see TOKEN in bin/energy-graph.
+const TOKEN = "__ENERGY_TOKEN__";
+// pid -> {state, until, note}. Held here rather than read back from the data, because
+// the whole problem is the gap between acting and the next sample arriving.
+const rowState = new Map();
+let sortKey = "self_now", sortDesc = true;
+
+function stateOf(pid) {
+  const s = rowState.get(pid);
+  if (!s) return null;
+  if (s.until && Date.now() > s.until) { rowState.delete(pid); return null; }
+  return s;
+}
+
+async function stopProc(n, btn) {
+  rowState.set(n.pid, { state: "stopping", note: "stopping…", label: n.label });
+  renderProcs(lastData);                       // react to the click before the network
+  let out;
+  try {
+    const r = await fetch("/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Energy-Token": TOKEN },
+      body: JSON.stringify({ pid: n.pid, start: n.start || "" }),
+    });
+    out = await r.json();
+  } catch (e) {
+    out = { ok: false, error: "the viewer is not reachable" };
+  }
+  // A tombstone that outlives its usefulness is clutter; one that disappears instantly
+  // is the bug we started from. 20s, same as the menu bar's.
+  rowState.set(n.pid, out.ok
+    ? { state: "stopped", note: "stopped", until: Date.now() + 20000, label: n.label }
+    : { state: "failed", note: out.error || "could not stop", until: Date.now() + 20000, label: n.label });
+  renderProcs(lastData);
+}
+
+function depthOf(n, byPid) {
+  let d = 0, p = n.parent;
+  while (p && byPid.has(p) && d < 12) { d++; p = byPid.get(p).parent; }
+  return d;
+}
+
+function renderProcs(d) {
+  if (!d) return;
+  const wrap = $("procsWrap");
+  // Live data replaces this table every 5s. Losing the scroll position each time makes
+  // the view unusable for anything below the fold, which is most of it.
+  const keepScroll = wrap.scrollTop;
+  const q = $("q").value.trim().toLowerCase();
+  const byPid = new Map(d.nodes.map((n) => [n.pid, n]));
+
+  let rows = d.nodes.filter((n) =>
+    !q || n.label.toLowerCase().includes(q) || n.pid.includes(q) || (n.cmd || "").toLowerCase().includes(q));
+  const num = (v) => (typeof v === "number" ? v : -1);
+  rows = [...rows].sort((a, b) => {
+    const x = sortKey === "label" ? a.label.localeCompare(b.label) : num(a[sortKey]) - num(b[sortKey]);
+    return sortDesc ? -x : x;
+  });
+
+  // Tombstones for rows the sample no longer contains — the process is gone, which is
+  // precisely when the confirmation matters most.
+  const present = new Set(d.nodes.map((n) => n.pid));
+  const ghosts = [];
+  rowState.forEach((s, pid) => {
+    if (!present.has(pid) && stateOf(pid)) ghosts.push({ pid, label: s.label || "process", ghost: true, self_now: 0, self: 0, cmd: "" });
+  });
+
+  wrap.textContent = "";
+  const t = document.createElement("table");
+  const thead = document.createElement("thead"), hr = document.createElement("tr");
+  [["label", "process", ""], ["self_now", "now", "num"], ["self", "avg 10m", "num"],
+   ["sub_now", "tree now", "num"], ["pid", "pid", "num"], [null, "owner", ""],
+   [null, "command", ""], [null, "", ""]].forEach(([key, text, cls]) => {
+    const th = document.createElement("th");
+    th.textContent = text;
+    if (cls) th.className = cls;
+    if (key) {
+      if (key === sortKey) {
+        const s = document.createElement("span");
+        s.className = "dir"; s.textContent = sortDesc ? " ▼" : " ▲";
+        th.append(s);
+      }
+      th.addEventListener("click", () => {
+        if (sortKey === key) sortDesc = !sortDesc; else { sortKey = key; sortDesc = true; }
+        renderProcs(lastData);
+      });
+    } else { th.style.cursor = "default"; }
+    hr.append(th);
+  });
+  thead.append(hr);
+
+  const tb = document.createElement("tbody");
+  [...ghosts, ...rows].forEach((n) => {
+    const st = stateOf(n.pid);
+    const tr = document.createElement("tr");
+    if (st) tr.className = st.state;
+    const add = (v, cls) => {
+      const td = document.createElement("td");
+      td.textContent = v;                            // untrusted: never innerHTML
+      if (cls) td.className = cls;
+      tr.append(td);
+      return td;
+    };
+    const indent = n.ghost ? 0 : depthOf(n, byPid);
+    const nameCell = add((indent ? "· ".repeat(indent) : "") + n.label, "name");
+    if (st) {
+      const tag = document.createElement("span");
+      tag.className = "rowstate"; tag.textContent = "  — " + st.note;
+      nameCell.append(tag);
+    }
+    add(n.ghost ? "" : n.self_now.toFixed(1), "num");
+    add(n.ghost ? "" : n.self.toFixed(1), "num");
+    add(n.ghost ? "" : n.sub_now.toFixed(1), "num");
+    add(n.pid, "num");
+    add(n.session || n.attributed || "", "owner");
+    add(n.cmd || "", "cmdcell").title = n.cmd || "";
+    const act = document.createElement("td");
+    if (!n.ghost && !(st && st.state === "stopped")) {
+      const b = document.createElement("button");
+      b.className = "stop";
+      b.textContent = st && st.state === "stopping" ? "stopping…" : "Stop";
+      b.disabled = !!(st && st.state === "stopping");
+      b.addEventListener("click", () => stopProc(n, b));
+      act.append(b);
+    }
+    tr.append(act);
+    tb.append(tr);
+  });
+  t.append(thead, tb);
+  wrap.append(t);
+  wrap.scrollTop = keepScroll;
+  $("qcount").textContent = `${rows.length} of ${d.nodes.length} processes`;
+}
+
 function setMode() {
-  $("stage").hidden = tableMode;
-  $("tableWrap").hidden = !tableMode;
+  $("stage").hidden = view !== "graph";
+  $("tableWrap").hidden = view !== "table";
+  $("procsPane").hidden = view !== "procs";
   if (lastData) render(lastData);
 }
 
@@ -547,12 +733,18 @@ $("pause").addEventListener("click", (e) => {
   e.target.setAttribute("aria-pressed", String(paused));
   e.target.textContent = paused ? "Resume" : "Pause";
 });
-$("asTable").addEventListener("click", (e) => {
-  tableMode = !tableMode;
-  e.target.setAttribute("aria-pressed", String(tableMode));
-  e.target.textContent = tableMode ? "Diagram" : "Table";
+function setView(next) {
+  view = view === next ? "graph" : next;
+  for (const [id, name] of [["asTable", "table"], ["asProcs", "procs"]]) {
+    $(id).setAttribute("aria-pressed", String(view === name));
+  }
+  $("asTable").textContent = view === "table" ? "Diagram" : "Table";
   setMode();
-});
+}
+$("asTable").addEventListener("click", () => setView("table"));
+$("asProcs").addEventListener("click", () => setView("procs"));
+// Typing filters immediately; it must not wait for the next 5s poll.
+$("q").addEventListener("input", () => renderProcs(lastData));
 $("plumb").addEventListener("click", (e) => {
   plumbing = !plumbing;
   e.target.setAttribute("aria-pressed", String(plumbing));

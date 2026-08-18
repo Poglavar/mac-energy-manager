@@ -73,11 +73,19 @@ graph_json() {
 serve() {
   local port="$1"
   exec env REPO="$REPO" GRAPH_PORT="$port" "$(em_python)" - <<'PY'
-import json, os, re, subprocess, time, urllib.parse
+import hmac, json, os, re, secrets, subprocess, time, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPO = os.environ["REPO"]
 PORT = int(os.environ["GRAPH_PORT"])
+
+# Minted per run and handed only to a page this server itself served. Stopping a process
+# is the first thing here that CHANGES the machine, so it needs more than the read checks
+# below: those keep a foreign page from READING the process list, and a read that leaks is
+# bad, but a write that lands is worse. Required in a custom header, which a cross-origin
+# page cannot set without a preflight — and the preflight fails, because _cors() answers
+# only local origins. Token + custom header + Origin + Host, all four.
+TOKEN = secrets.token_urlsafe(32)
 
 
 # Only pages served from this machine may read the process list. `*` would let
@@ -96,6 +104,37 @@ LOCAL_ORIGIN = re.compile(r"^http://(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$
 # hostname in Host. That matters here more than for most local servers: /data.json
 # returns full command lines, which routinely carry API keys and tokens.
 LOCAL_HOST = re.compile(r"^(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$", re.I)
+
+
+def pid_start_times() -> dict:
+    """pid -> start time, for every process. One ps call, not one per row."""
+    out = subprocess.run(["ps", "-Ao", "pid=,lstart="], capture_output=True, timeout=10)
+    starts = {}
+    for line in out.stdout.decode("utf-8", "replace").splitlines():
+        pid, _, rest = line.strip().partition(" ")
+        if pid.isdigit():
+            starts[pid] = " ".join(rest.split())
+    return starts
+
+
+def with_start_times(raw: bytes) -> bytes:
+    """Stamp each node with its start time.
+
+    A pid is not an identity — the OS reuses the number, and between the render and the
+    click the row's pid can belong to something else entirely. Carrying the start time
+    lets /stop refuse a stale click instead of killing a stranger. Added here rather than
+    in the awk pipeline so the menu bar's hot path pays nothing for it.
+    """
+    if not raw:
+        return raw
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        return raw
+    starts = pid_start_times()
+    for n in d.get("nodes", []):
+        n["start"] = starts.get(str(n.get("pid", "")), "")
+    return json.dumps(d).encode()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -145,7 +184,12 @@ class Handler(BaseHTTPRequestHandler):
         q = urllib.parse.parse_qs(url.query)
         if url.path in ("/", "/index.html"):
             with open(os.path.join(REPO, "web", "graph.html"), "rb") as fh:
-                self._send(fh.read(), "text/html; charset=utf-8")
+                page = fh.read()
+            # The token reaches the page only by being served with it. Nothing else can
+            # obtain it: it is not in a cookie (which a rebound origin would send for us),
+            # not on disk, and not in the URL (which lands in history and referrers).
+            self._send(page.replace(b"__ENERGY_TOKEN__", TOKEN.encode()),
+                       "text/html; charset=utf-8")
         elif url.path == "/data.json":
             mn = q.get("min", ["0.3"])[0]
             pl = q.get("plumbing", ["0"])[0]
@@ -156,7 +200,8 @@ class Handler(BaseHTTPRequestHandler):
             pl = "1" if pl == "1" else "0"
             out = subprocess.run([os.path.join(REPO, "bin", "energy-graph"), "json", mn, pl],
                                  capture_output=True, timeout=20)
-            self._send(out.stdout or b'{"nodes":[],"peak":0,"total":0,"generated":0}',
+            self._send(with_start_times(out.stdout) or
+                       b'{"nodes":[],"peak":0,"total":0,"generated":0}',
                        "application/json")
         elif url.path == "/load.json":
             # Polled by dev tools that need to know whether a timing they just
@@ -187,10 +232,68 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def _reject(self, code: int, why: str) -> None:
+        body = json.dumps({"ok": False, "error": why}).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self._cors()
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:
+        if not self._local_host_only():
+            return
+        if urllib.parse.urlparse(self.path).path != "/stop":
+            return self._reject(404, "no such endpoint")
+        # Unlike GET, an absent Origin is not tolerated: every legitimate caller is the
+        # page we served, and fetch() always sends one.
+        origin = self.headers.get("Origin", "")
+        if not LOCAL_ORIGIN.match(origin):
+            return self._reject(403, "bad origin")
+        if not hmac.compare_digest(self.headers.get("X-Energy-Token", ""), TOKEN):
+            return self._reject(403, "bad token")
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(min(n, 4096)) or b"{}")
+        except (ValueError, TypeError):
+            return self._reject(400, "bad body")
+        pid = str(body.get("pid", ""))
+        if not pid.isdigit() or pid == "0":
+            return self._reject(400, "bad pid")
+        # The row was drawn from a snapshot. If the pid has been recycled since, the
+        # start time no longer matches and this click is about a process that no longer
+        # exists — refuse rather than kill whoever inherited the number.
+        want, have = str(body.get("start", "")), pid_start_times().get(pid, "")
+        if not have:
+            return self._reject(409, "already gone")
+        if want and want != have:
+            return self._reject(409, "pid reused since the page drew it")
+        # Reuse the audited shell path rather than signalling from here: escalation,
+        # notification and the stopped/stopping bookkeeping all live there, and two kill
+        # paths that can disagree is how one of them silently rots.
+        out = subprocess.run(
+            [os.path.join(REPO, "plugins", "energy.10s.sh"), "stop", "-", pid],
+            capture_output=True, timeout=60,
+            env={**os.environ, "EM_NO_NOTIFY": os.environ.get("EM_NO_NOTIFY", "")})
+        gone = pid not in pid_start_times()
+        body = json.dumps({"ok": gone, "pid": pid,
+                           "error": "" if gone else "still running after SIGKILL"}).encode()
+        self.send_response(200 if gone else 502)
+        self.send_header("Content-Type", "application/json")
+        self._cors()
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_OPTIONS(self) -> None:                  # preflight, for anything non-simple
         self.send_response(204)
         self._cors()
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        # Only echoed to a local origin, because _cors() sets no ACAO for anything else —
+        # so a foreign page's preflight for the token header fails and its POST is never
+        # sent. This line is the reason the custom header is worth requiring.
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Energy-Token")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
