@@ -329,13 +329,68 @@ report() {
         }' "$LOG"
 }
 
+# ---- Chrome's code-sign clones ----------------------------------------------
+# On every launch Chrome copies its own .app bundle (an APFS clonefile) into
+#   $DARWIN_USER_TEMP_DIR/../X/com.google.Chrome.code_sign_clone/code_sign_clone.XXXXXX
+# so its helper processes keep a consistent, signed bundle if the app is updated underneath
+# them. It removes the clone only on a CLEAN exit. `kill -9` — this script's whole job — never
+# gives it that turn, so every reaped browser leaves one behind: 119 had piled up in three
+# weeks (2026-08-10 → 2026-09-02). `du` says 1.4 GB each, but clones of the same Chrome build
+# share blocks, so the real cost is ~1.4 GB per Chrome *version* since updated away, plus
+# ~3,000 inodes apiece and a `du` that lies by 190 GB. Sweep every clone no process holds
+# open. lsof is the only thing that knows; the running real Chrome holds exactly one.
+# A clone younger than two minutes is left alone — a browser mid-launch has created it but
+# may not have opened its descriptor yet.
+CLONE_MIN_AGE_MIN=2
+
+clone_root() {
+    local t; t="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null)"; t="${t%/}"
+    [ -n "$t" ] && printf '%s' "${t%/T}/X"
+}
+
+# Emit one stale clone dir per line. Every Chromium-family browser leaks the same way into its
+# own root (com.brave.Browser.code_sign_clone sits next to Chrome's), and their processes are
+# NOT all named "chrom" — so the held set comes from lsof over ALL processes, never a pgrep
+# by name: a name filter once missed Brave and swept the clone its live browser was holding.
+# The full lsof costs a few seconds, so it runs only when there is a candidate to judge.
+stale_clones() {
+    local root held cands d name
+    root="$(clone_root)"; [ -d "$root" ] || return 0
+    cands="$(find "$root" -mindepth 2 -maxdepth 2 -type d -path '*.code_sign_clone/code_sign_clone.*' \
+                  -mmin "+$CLONE_MIN_AGE_MIN" 2>/dev/null)"
+    [ -n "$cands" ] || return 0
+    held="$(lsof -n 2>/dev/null | grep -o 'code_sign_clone\.[A-Za-z0-9]*' | sort -u)"
+    printf '%s\n' "$cands" | while read -r d; do
+        [ -z "$d" ] && continue
+        name="${d##*/}"
+        printf '%s\n' "$held" | grep -qx "$name" && continue
+        printf '%s\n' "$d"
+    done
+}
+
+sweep_clones() {
+    local n=0 d
+    while read -r d; do
+        [ -z "$d" ] && continue
+        # stderr: the caller captures stdout as the count, and a dry run must still be visible.
+        if [ "$DRY" -eq 1 ]; then echo "browser-reap: WOULD remove stale clone $d" >&2; n=$((n + 1)); continue; fi
+        rm -rf "$d" 2>/dev/null && n=$((n + 1))
+    done <<< "$(stale_clones)"
+    printf '%s' "$n"
+}
+
 if [ "$MODE" = report ]; then report "${SINCE:-0000-00-00}"; exit $?; fi
 
 INSTANCES="$(collect)"
 
 if [ -z "$INSTANCES" ]; then
-    [ "$MODE" = status ] && echo "browser-reap: no automation browsers running"
-    heartbeat "nothing running"
+    if [ "$MODE" = status ]; then
+        echo "browser-reap: no automation browsers running"
+        n=$(stale_clones | grep -c .); [ "$n" -gt 0 ] && echo "  stale code-sign clones: $n (swept on the next reap)"
+        exit 0
+    fi
+    SWEPT=$(sweep_clones)
+    heartbeat "nothing running, $SWEPT stale clone(s) swept"
     exit 0
 fi
 
@@ -359,6 +414,7 @@ if [ "$MODE" = status ]; then
             "$(echo "$pids" | tr ',' '\n' | wc -l | tr -d ' ')" "$dir" "$own"
         printf '  %-8s %-3s         %s\n' "" "" "$verdict"
     done <<< "$INSTANCES"
+    n=$(stale_clones | grep -c .); [ "$n" -gt 0 ] && echo "  stale code-sign clones: $n (swept on the next reap)"
     exit 0
 fi
 
@@ -416,6 +472,10 @@ if [ "$DRY" -eq 0 ] && [ -z "$(collect)" ] && [ -d "$HOME/.agent-browser" ]; the
     find "$HOME/.agent-browser" -maxdepth 1 -name '*.config' -mtime +2 -delete 2>/dev/null
 fi
 
-heartbeat "$KILLED instance(s) killed, $SPARED under TTL"
+# Clones left by THIS run's kills are seconds old and still under CLONE_MIN_AGE_MIN; the next
+# run, five minutes later, takes them. Sweeping here catches everything earlier runs left.
+SWEPT=$(sweep_clones)
+
+heartbeat "$KILLED instance(s) killed, $SPARED under TTL, $SWEPT stale clone(s) swept"
 
 exit 0
