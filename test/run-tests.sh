@@ -142,6 +142,39 @@ DON=$(awk -f lib/label.awk -f lib/tree.awk test/fixtures/daemonowner.energy.tsv 
 is "unstamped, the daemon still falls back to cmux" "" \
    "$(printf '%s\n' "$DON" | awk -F'\t' '$1=="R"&&$2==900{print $2}')"
 
+echo "== stamping a launchd job =="
+# A job submitted with `launchctl submit` (agents/bin/run-job) cannot be recovered by any
+# signal afterwards: macOS hides its environment from ps -E, makes it its own responsible
+# process, and gives it its own process group — so all three point back at the job itself.
+# Measured 2026-09-06: 22 of 22 live jobs were unattributed, one of them the machine's top
+# consumer. The only fix is a record written at launch, and the job's ppid is 1 from its
+# first instruction, so the SUBMITTING shell has to supply the owner explicitly.
+sleep 30 & JOBPID=$!
+JOBSTART=$(ps -o lstart= -p $JOBPID | awk 'NF{print $1"_"$2"_"$3"_"$4"_"$5}')
+bin/browser-stamp --pid $JOBPID --owner $$ >/dev/null 2>&1
+is "an explicit owner is recorded for a process with no usable ancestry" "$$" \
+   "$(awk -F'\t' -v k="pid:$JOBPID:$JOBSTART" '$1==k{print $2}' "$STATE_DIR/browser-owners.tsv")"
+# A dead owner would only ever produce a row tree.awk refuses, and one that a recycled pid
+# could later make actively wrong.
+# A pid that is not running. sh prints its own and exits, so the number is free the moment
+# the substitution returns. Backgrounding a child and killing it looks simpler and is a
+# trap: when the signal lands before the child has exec'd, it is still a fork of THIS shell
+# and runs this script's EXIT trap — which rm -rf's the suite's own temp dir underneath it.
+DEAD=$(sh -c 'echo $$')
+for _ in 1 2 3 4 5; do ps -p "$DEAD" >/dev/null 2>&1 || break; DEAD=$(sh -c 'echo $$'); done
+bin/browser-stamp --pid $JOBPID --owner $DEAD >/dev/null 2>&1
+is "a dead owner is refused rather than recorded" "$$" \
+   "$(awk -F'\t' -v k="pid:$JOBPID:$JOBSTART" '$1==k{print $2}' "$STATE_DIR/browser-owners.tsv")"
+is "a process is never recorded as its own owner" "" \
+   "$(bin/browser-stamp --pid $JOBPID --owner $JOBPID >/dev/null 2>&1; \
+      awk -F'\t' -v k="pid:$JOBPID:$JOBSTART" -v j="$JOBPID" '$1==k && $2==j{print "self"}' "$STATE_DIR/browser-owners.tsv")"
+kill $JOBPID 2>/dev/null
+# --tab-owner answers with the tab's own shell rather than the agent inside it, because a
+# job routinely outlives the session that submitted it while the tab stays open for weeks.
+is "--tab-owner names a live process" "yes" \
+   "$(o=$(bin/browser-stamp --tab-owner | cut -f1); \
+      [ -n "$o" ] && ps -p "$o" >/dev/null 2>&1 && echo yes || echo no)"
+
 echo "== cmux tab names =="
 # A session id is what the machine calls a session; the cmux tab title is what the human
 # calls it, and only one of them says which work is eating a core. Fixture also uses a

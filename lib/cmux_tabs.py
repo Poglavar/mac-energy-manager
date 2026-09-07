@@ -35,37 +35,75 @@ def clean(title, limit=30):
     return t[:limit].rstrip() if len(t) > limit else t
 
 
-def rows(path):
+def load(path):
     try:
         with open(path) as fh:
-            data = json.load(fh)
+            return json.load(fh)
     except (OSError, ValueError):
-        return
+        return None
+
+
+def panels(data):
+    """(workspace, panel) pairs. cmux owns this shape and may change it, so every level
+    is checked rather than assumed."""
     for window in data.get("windows") or []:
         tm = window.get("tabManager") or {}
         for ws in tm.get("workspaces") or []:
             if not isinstance(ws, dict):
                 continue
-            project = os.path.basename((ws.get("currentDirectory") or "").rstrip("/"))
-            title = clean(ws.get("customTitle") or ws.get("processTitle") or "")
             for panel in ws.get("panels") or []:
-                if not isinstance(panel, dict):
-                    continue
-                agent = (panel.get("terminal") or {}).get("agent") or {}
-                sid = agent.get("sessionId")
-                if not isinstance(sid, str) or len(sid) < 8:
-                    continue
-                # 8 chars is what the monitor's shortid() pulls out of a command line,
-                # so that is the key both sides can agree on without parsing UUIDs.
-                yield sid[:8], (title or project), project
+                if isinstance(panel, dict):
+                    yield ws, panel
+
+
+def session_files():
+    """Newest last, so a live window's state wins over a stale previous-session file."""
+    for path in sorted(glob.glob(SESSION_GLOB), key=os.path.getmtime):
+        if not path.endswith("-previous.json"):
+            yield path
+
+
+def rows(path):
+    data = load(path)
+    if data is None:
+        return
+    for ws, panel in panels(data):
+        project = os.path.basename((ws.get("currentDirectory") or "").rstrip("/"))
+        title = clean(ws.get("customTitle") or ws.get("processTitle") or "")
+        agent = (panel.get("terminal") or {}).get("agent") or {}
+        sid = agent.get("sessionId")
+        if not isinstance(sid, str) or len(sid) < 8:
+            continue
+        # 8 chars is what the monitor's shortid() pulls out of a command line,
+        # so that is the key both sides can agree on without parsing UUIDs.
+        yield sid[:8], (title or project), project
+
+
+def panel_ttys():
+    """{cmux panel id: tty name}, e.g. {"3F2B91C4-...": "ttys038"}.
+
+    The other join this file can serve, and the durable one. A session id names the AGENT
+    in a tab, which is gone within hours; a panel id names the TAB, which lives for weeks.
+    Something a session detached — a dev server, a bake, a browser — routinely outlives the
+    agent that started it, and once that agent exits there is nothing left to bill it to.
+    Panel id → tty → the tty's session leader gets it an owner that is still there tomorrow.
+    See lib/attribution.py, which reads the panel id back out of the process's environment.
+    """
+    out = {}
+    for path in session_files():
+        data = load(path)
+        if data is None:
+            continue
+        for _, panel in panels(data):
+            pid, tty = panel.get("id"), panel.get("ttyName")
+            if isinstance(pid, str) and isinstance(tty, str) and pid and tty:
+                out[pid] = tty
+    return out
 
 
 def main():
     seen = {}
-    # Newest last, so a live window's titles win over a stale previous-session file.
-    for path in sorted(glob.glob(SESSION_GLOB), key=os.path.getmtime):
-        if path.endswith("-previous.json"):
-            continue
+    for path in session_files():
         for sid, title, project in rows(path):
             seen[sid] = (title, project)
     out = []

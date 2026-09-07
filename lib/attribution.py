@@ -15,9 +15,24 @@ signals here need no cooperation at all, because macOS itself carries them:
               (an orphaned node returns cmux; a Chrome helper returns Chrome), so it is a
               coarser answer than env, but it generalises the cmux fallback that
               lib/tree.awk otherwise has to hard-code by name.
-  pgid        A detached child usually keeps its process group. Weakest of the three — a
+  panel       The cmux TAB the work came from, read out of the same environment. This is
+              the durable answer: env and responsible both name the AGENT, which is gone
+              within hours, while a tab lives for weeks — and the things that end up
+              orphaned (a dev server, a bake, a browser) routinely outlive the session
+              that started them. Panel id → tty (lib/cmux_tabs.py) → that tty's session
+              leader, which is the tab's own login shell.
+  pgid        A detached child usually keeps its process group. Weakest of them all — a
               real daemon calls setsid() and loses it — but it is one more ps field in a
               script that is already running, so it costs nothing to try last.
+
+NOT covered here, because macOS makes it impossible: a job submitted with `launchctl
+submit` (agents/bin/run-job). Its environment is hidden from ps -E even though its own
+children's is readable, it is its own responsible process, and launchd gives it its own
+process group — so all four signals point back at the job itself. Measured 2026-09-06:
+22 of 22 live jobs unattributed. That case is handled the only way it can be, by writing
+the owner down at launch (bin/browser-stamp --pid ... --owner ...), exactly as a detached
+browser is. The AGENT_JOB_* variables below are how such a job passes the answer on to
+whatever IT later detaches, since those children can be read normally.
 
 Output, one row per resolved process:
 
@@ -46,7 +61,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-IDENTITY_VARS = ("CLAUDE_PID", "CLAUDE_CODE_SESSION_ID", "CMUX_PANEL_ID")
+# AGENT_JOB_* are stamped by agents/bin/run-job onto everything a detached job spawns; the
+# rest are set by the agent CLI and cmux themselves. Same meaning either way: who asked.
+IDENTITY_VARS = ("CLAUDE_PID", "CLAUDE_CODE_SESSION_ID", "CMUX_PANEL_ID",
+                 "AGENT_JOB_OWNER_PID", "AGENT_JOB_OWNER_SESSION", "AGENT_JOB_PANEL_ID")
 
 # Never bill a tree to one of these even when a signal points at it: they are the machine
 # rather than a piece of anyone's work, and adopting onto them collapses the forest into
@@ -110,6 +128,48 @@ def responsible_pid(pid: str) -> int:
         return 0
 
 
+_panel_tty: dict[str, str] | None = None
+_tty_leader: dict[str, str] | None = None
+
+
+def panel_ttys() -> dict[str, str]:
+    """{cmux panel id: tty}, from cmux's own session file. Empty if it cannot be read."""
+    global _panel_tty
+    if _panel_tty is None:
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import cmux_tabs
+            _panel_tty = cmux_tabs.panel_ttys()
+        except (ImportError, OSError, ValueError):
+            _panel_tty = {}
+    return _panel_tty
+
+
+def tty_leaders() -> dict[str, str]:
+    """{tty: the pid that owns it} — the process on that tty whose parent is NOT on it.
+
+    That is the tab's own login shell, and it is deliberately coarser than the agent
+    running inside it: it is still there tomorrow. One ps call for the whole table, and no
+    environment is read to build it.
+    """
+    global _tty_leader
+    if _tty_leader is None:
+        rows, tty = [], {}
+        for line in ps_out(["-axo", "pid=,ppid=,tty="]).splitlines():
+            f = line.split()
+            if len(f) == 3 and f[2] != "??":
+                rows.append(f)
+                tty[f[0]] = f[2]
+        leaders: dict[str, str] = {}
+        for pid, ppid, t in rows:
+            if tty.get(ppid) == t:
+                continue                        # parent shares the tty: not the leader
+            if t not in leaders or int(pid) < int(leaders[t]):
+                leaders[t] = pid
+        _tty_leader = leaders
+    return _tty_leader
+
+
 def read_procs(path: Path) -> dict[str, dict[str, str]]:
     procs: dict[str, dict[str, str]] = {}
     for line in path.read_text(errors="ignore").splitlines():
@@ -127,9 +187,19 @@ def usable(cand: str, pid: str, procs: dict[str, dict[str, str]]) -> bool:
 def resolve(pid: str, procs: dict[str, dict[str, str]]) -> tuple[str, str, str] | None:
     """(owner_pid, source, session_id) from the strongest signal that answers."""
     ident = identity_from_env(pid)
-    session = ident.get("CLAUDE_CODE_SESSION_ID", "")
-    if usable(ident.get("CLAUDE_PID", ""), pid, procs):
-        return ident["CLAUDE_PID"], "env", session
+    session = ident.get("CLAUDE_CODE_SESSION_ID") or ident.get("AGENT_JOB_OWNER_SESSION", "")
+    owner = ident.get("AGENT_JOB_OWNER_PID") or ident.get("CLAUDE_PID", "")
+    if usable(owner, pid, procs):
+        return owner, "env", session
+
+    # The agent named above is dead (or was never named) but the tab it ran in may still be
+    # open, and that is a truthful owner for anything the tab detached. Tried before
+    # "responsible" because it names one TAB where responsible names the whole cmux app.
+    panel = ident.get("AGENT_JOB_PANEL_ID") or ident.get("CMUX_PANEL_ID", "")
+    if panel:
+        leader = tty_leaders().get(panel_ttys().get(panel, ""), "")
+        if usable(leader, pid, procs):
+            return leader, "panel", session
 
     rp = str(responsible_pid(pid) or "")
     if usable(rp, pid, procs):

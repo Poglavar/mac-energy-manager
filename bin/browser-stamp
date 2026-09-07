@@ -32,9 +32,14 @@ AGENT_RE='^(claude|codex|copilot|aider|gemini|cursor-agent)$'
 usage() {
   cat >&2 <<'EOF'
 Usage: browser-stamp <name>          print a stamped --user-data-dir, record the owner
-       browser-stamp --pid <pid>     record an already-running process as owned
+       browser-stamp --pid <pid> [--owner <pid>]
+                                     record an already-running process as owned. --owner
+                                     names the launcher explicitly, for a process whose own
+                                     ancestry cannot reveal it (a launchd-submitted job)
        browser-stamp --list          show current owner records
        browser-stamp --owner         print the owner this shell would be stamped as
+       browser-stamp --tab-owner     print the terminal tab's own shell, which outlives
+                                     every agent session that runs inside it
 
 The name identifies the browser, not the owner (e.g. "frames", "isochrone"); the
 owner is prepended so two sessions asking for the same name get separate profiles.
@@ -64,6 +69,28 @@ find_owner() {
   printf '%s' "$PPID"          # no agent above us: the caller owns it
 }
 
+# The terminal TAB's own shell: the last process below cmux on this chain. Where find_owner
+# answers "which agent asked for this", this answers "which tab did it come from" — a coarser
+# owner, but one that outlives every agent inside it. That is the difference between a record
+# that survives the night and one that does not: an agent session ends in minutes to hours, while
+# the job it submitted (a dev server, a bake) is routinely still running days later. Falls back to
+# find_owner when there is no cmux above us, e.g. a plain terminal.
+find_tab_owner() {
+  local p=$PPID b last="" i
+  for ((i = 0; i < 32; i++)); do
+    [ "${p:-0}" -gt 1 ] 2>/dev/null || break
+    b=$(pcomm "$p") || break
+    [ -n "$b" ] || break
+    if [ "$b" = "cmux" ]; then
+      if [ -n "$last" ]; then printf '%s' "$last"; return; fi
+      break
+    fi
+    last=$p
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+  done
+  find_owner
+}
+
 # Rewrite rather than append: a row whose owner has exited (or whose pid was recycled
 # into a different process) is stale, and a stale row would graft a browser tree onto a
 # stranger. Checking on every write keeps the file the size of the live session set.
@@ -86,13 +113,26 @@ case "${1:-}" in
   ''|-h|--help) usage ;;
   --list) [ -f "$OWNERS" ] && cat "$OWNERS" || echo "no owner records" >&2; exit 0 ;;
   --owner) o=$(find_owner); printf '%s\t%s\n' "$o" "$(pcomm "$o" || echo unknown)"; exit 0 ;;
+  --tab-owner) o=$(find_tab_owner); printf '%s\t%s\n' "$o" "$(pcomm "$o" || echo unknown)"; exit 0 ;;
   --pid)
     dpid=${2:-}
     [[ $dpid =~ ^[0-9]+$ ]] || usage
     dstart=$(pstart "$dpid")
     [ -n "$dstart" ] || exit 0                     # already gone: nothing worth recording
-    owner=$(find_owner)
+    # An explicit owner, for a process whose OWN ancestry cannot reveal its launcher. A
+    # launchd-submitted job (agents/bin/run-job) has ppid 1 from its first instruction, so
+    # find_owner would walk straight to launchd and learn nothing — and macOS additionally
+    # hides such a job's environment from ps -E, so there is no signal left to recover it
+    # afterwards either. The submitting shell is the only thing that knows, so it passes the
+    # answer down and the job records it for itself.
+    if [ "${3:-}" = "--owner" ]; then
+      owner=${4:-}
+      [[ $owner =~ ^[0-9]+$ ]] || usage
+    else
+      owner=$(find_owner)
+    fi
     [ "$owner" = "$dpid" ] && exit 0               # never make a process own itself
+    [ -n "$(pstart "$owner")" ] || exit 0          # a dead owner would only ever be a stale row
     # The daemon's own start time is part of the key, so the row stops matching the
     # instant that pid is recycled — the same guard the owner side gets from its start
     # time, applied to the other end of the link.
