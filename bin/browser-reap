@@ -46,6 +46,11 @@
 # falls back to total age (--ttl). A browser whose owner has EXITED cannot be in use by anyone
 # and gets the shortest fuse of all (--orphan-ttl).
 #
+# Markers are keyed by PID, and PIDs are recycled: a marker older than the browser belongs to a
+# previous process and is ignored, and markers of exited processes are pruned on every run
+# (lib/reap-idle.sh). Before that, 1,600 leftovers made fresh Playwright browsers look idle for
+# days and they were killed about a minute after launch.
+#
 # A browser with NO owner record is treated as *unknown*, not as garbage, and keeps the age
 # fallback — Playwright and Puppeteer do not stamp, and a 12-minute test run must not be shot
 # in the back.
@@ -63,6 +68,8 @@
 #   browser-reap --install [sec] install the launchd timer (default every 300s)
 #   browser-reap --uninstall     remove the timer, keep the ledger
 set -uo pipefail
+# Resolve through the agents/bin symlink so the shared helpers load from this checkout.
+. "$(dirname "$(readlink -f "$0")")/../lib/reap-idle.sh"
 
 TTL_MIN=45          # fallback: total age, for browsers nothing reports usage for
 IDLE_TTL_MIN=15     # primary: minutes since the browser was last driven
@@ -212,12 +219,15 @@ collect() {
 #
 # Written by the agent-browser wrapper on every command. A hand-launched browser has no
 # such hot path, so it returns "" and falls back to age — the honest degradation.
+#
+# The marker is keyed by a recycled PID, so it is trusted only when it is not older than the
+# browser itself (lib/reap-idle.sh explains the fresh-browser kills that caused this).
 idle_seconds() {
-    local rootpp="$1" f mtime
+    local rootpp="$1" age="$2" f mtime
     f="$ACTIVITY/pid-$rootpp"
     [ -f "$f" ] || { printf ''; return; }
     mtime=$(stat -f %m "$f" 2>/dev/null) || { printf ''; return; }
-    printf '%s' "$(( $(date +%s) - mtime ))"
+    marker_idle "$mtime" "$(date +%s)" "$age"
 }
 
 owner_state() {
@@ -390,7 +400,9 @@ if [ -z "$INSTANCES" ]; then
         exit 0
     fi
     SWEPT=$(sweep_clones)
-    heartbeat "nothing running, $SWEPT stale clone(s) swept"
+    PRUNED=0
+    [ "$DRY" -eq 0 ] && PRUNED=$(prune_activity_markers "$ACTIVITY")
+    heartbeat "nothing running, $SWEPT stale clone(s) swept, $PRUNED stale marker(s) pruned"
     exit 0
 fi
 
@@ -399,7 +411,7 @@ if [ "$MODE" = status ]; then
     while IFS=$'\t' read -r age dir pids rootpp; do
         [ -z "$dir" ] && continue
         st=$(owner_state "$dir" "$rootpp")
-        idle=$(idle_seconds "$rootpp")
+        idle=$(idle_seconds "$rootpp" "$age")
         who=$(owner_label "$dir"); [ -n "$who" ] || who="?"
         case "$st" in
             alive)   own="owner $who (alive)" ;;
@@ -440,7 +452,7 @@ fi
 while IFS=$'\t' read -r age dir pids rootpp; do
     [ -z "$dir" ] && continue
     st=$(owner_state "$dir" "$rootpp")
-    idle=$(idle_seconds "$rootpp")
+    idle=$(idle_seconds "$rootpp" "$age")
     # Prefer "how long since anyone drove this" over "how long has it existed". A browser
     # in constant use is never killed however old it is; an idle one dies on schedule
     # however alive its owner is. Age is the fallback for browsers nothing reports on.
@@ -476,6 +488,10 @@ fi
 # run, five minutes later, takes them. Sweeping here catches everything earlier runs left.
 SWEPT=$(sweep_clones)
 
-heartbeat "$KILLED instance(s) killed, $SPARED under TTL, $SWEPT stale clone(s) swept"
+# Markers of exited processes are litter that a recycled PID would otherwise inherit.
+PRUNED=0
+[ "$DRY" -eq 0 ] && PRUNED=$(prune_activity_markers "$ACTIVITY")
+
+heartbeat "$KILLED instance(s) killed, $SPARED under TTL, $SWEPT stale clone(s) swept, $PRUNED stale marker(s) pruned"
 
 exit 0

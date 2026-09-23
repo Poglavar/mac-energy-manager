@@ -658,6 +658,21 @@ else
   echo "  skip Google Chrome is not running"
 fi
 
+echo "== browser-reap idle clock =="
+# A pid marker is keyed by a recycled PID. One written for an earlier process must not make a
+# brand-new browser look idle for days (fresh Playwright browsers were killed a minute after
+# opening, 2026-09-23), while a marker touched after the browser started is its real idle time.
+. lib/reap-idle.sh
+is "a marker older than the browser is ignored" "" "$(marker_idle 1000 100000 60)"
+is "a marker touched after launch gives idle time" "30" "$(marker_idle 99970 100000 600)"
+is "a marker written with the launch command counts" "65" "$(marker_idle 99935 100000 60)"
+is "garbage input yields no idle reading" "" "$(marker_idle abc 100000 60)"
+MK="$TMPD/activity"; mkdir -p "$MK"; : > "$MK/pid-111"; : > "$MK/pid-222"; : > "$MK/pid-3333"; : > "$MK/notes"
+is "markers of exited processes are pruned" "2" "$(prune_activity_markers "$MK" "222 9 1")"
+is "the live process keeps its marker" "notes pid-222" "$(ls "$MK" | tr '\n' ' ' | sed 's/ $//')"
+is "an empty process list prunes nothing" "0" "$(prune_activity_markers "$MK" "")"
+is "a failed process read keeps the live marker" "notes pid-222" "$(ls "$MK" | tr '\n' ' ' | sed 's/ $//')"
+
 echo
 if [ "$FAIL" -gt 0 ]; then echo "FAILED: $FAIL failed, $PASS passed"; exit 1; fi
 echo "PASSED: $PASS assertions"
