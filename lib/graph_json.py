@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import time
+from memory import capture_memory_state
 
 
 def main() -> None:
@@ -74,6 +75,7 @@ def main() -> None:
     json.dump({
         "generated": time.time(),
         "sample_age": sample_age,
+        "memory": capture_memory_state(),
         "nodes": nodes,
         # Causal cross-process links are separate from the process forest. In
         # particular, they never affect subtree totals or kill semantics.

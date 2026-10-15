@@ -639,9 +639,12 @@ FLAGGED="$(printf '%s\n' "$TREE" | awk -F'\t' '$1=="R" && $7==1')"
 # plus a ⚠ when something incompatible with the current mode is running.
 TOPVAL=$(printf '%s\n' "$TREE" | awk -F'\t' '$1=="R"{print $3; exit}')
 [ -n "$FLAGGED" ] && WARN=" ⚠" || WARN=""
+MEMORY_SUMMARY=$("$(em_python)" "$REPO/lib/memory.py" --summary 2>/dev/null)
+[ -n "$MEMORY_SUMMARY" ] || MEMORY_SUMMARY="Memory: Unavailable · swap unavailable"
 if [ -s "$CUR" ]; then echo "⚡${TOPVAL:-0}${WARN}"; else echo "⚡…"; fi
 echo "---"
 [ -s "$CUR" ] || echo "collecting first sample… | color=gray size=11"
+echo "$MEMORY_SUMMARY | size=11 color=gray"
 
 # Read once per render, not per row: this prunes the file as a side effect, so calling it
 # repeatedly would have each caller racing the others to rewrite it.

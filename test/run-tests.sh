@@ -14,6 +14,8 @@ TMPD=$(mktemp -d); trap 'rm -rf "$TMPD"' EXIT
 # Tests must never write where the running app reads.
 export STATE_DIR="$TMPD/state"; mkdir -p "$STATE_DIR"
 
+python3 test/test_memory.py || exit 1
+
 # Every stop the suite performs would otherwise fire a real macOS banner. Routing them to
 # a file keeps the run silent AND makes the feedback assertable.
 export EM_NOTIFY_LOG="$TMPD/notify.log"; : > "$EM_NOTIFY_LOG"

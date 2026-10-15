@@ -80,6 +80,9 @@ button[aria-pressed="true"] { color: var(--text-primary); border-color: var(--te
 .spacer { flex: 1; }
 .status { color: var(--text-muted); font-variant-numeric: tabular-nums; }
 .status.stale { color: var(--critical); }
+.memory-status { white-space: nowrap; }
+.memory-status.warning { color: var(--causal); }
+.memory-status.critical { color: var(--critical); }
 
 /* ---- legend: sequential scale ---- */
 .legend { display: flex; align-items: center; gap: 0; }
@@ -223,6 +226,7 @@ td.cmd {
   <div class="legend" id="legend" aria-hidden="true"><span class="cap">%cpu, 10&#8209;min avg</span></div>
 
   <div class="spacer"></div>
+  <div class="status memory-status unavailable" id="memoryStatus">Memory: Unavailable · swap unavailable</div>
   <div class="status" id="status">loading…</div>
 </header>
 
@@ -289,6 +293,14 @@ async function load() {
 }
 
 function setStatus(d) {
+  const memory = d.memory || {};
+  const memoryStatus = $("memoryStatus");
+  const pressure = ["Normal", "Warning", "Critical"].includes(memory.pressure)
+    ? memory.pressure : "Unavailable";
+  const swap = typeof memory.swap_used_gb === "number" && Number.isFinite(memory.swap_used_gb)
+    ? `${memory.swap_used_gb.toFixed(2)} GB` : "unavailable";
+  memoryStatus.textContent = `Memory: ${pressure} · swap ${swap}`;
+  memoryStatus.className = `status memory-status ${pressure.toLowerCase()}`;
   const s = $("status");
   const age = d.sample_age;
   // The plugin is the sampler. If nobody has sampled recently these averages are not

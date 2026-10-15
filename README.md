@@ -136,6 +136,10 @@ It is a **reader, not a second sampler** — the same `lib/*.awk` over the same 
 plugin writes, so the two can't disagree. It says so in red when the samples go stale
 rather than presenting old averages as current. Binds `127.0.0.1` only.
 
+The header and SwiftBar menu also show system memory pressure (Normal, Warning or
+Critical) and swap used. Unsupported or failed readings show Unavailable; these
+values do not change the CPU ranking.
+
 ### `load` — "is this machine busy, and who by?"
 
 One `ps` and one awk pass, ~40 ms, for other tools to poll:
