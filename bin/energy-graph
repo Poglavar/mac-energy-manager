@@ -156,12 +156,11 @@ class Handler(BaseHTTPRequestHandler):
     def _send(self, body: bytes, ctype: str) -> None:
         self.send_response(200)
         self.send_header("Content-Type", ctype)
-        # This page loads no scripts, styles, fonts or images from anywhere but itself,
-        # and talks to nothing off-box. Saying so means that even a future escape from
-        # the textContent-only rendering could not exfiltrate the process list.
+        # The page loads its stylesheet from this same-origin server and talks to
+        # nothing off-box. Inline styles remain limited to data-driven diagram geometry.
         self.send_header("Content-Security-Policy",
                          "default-src 'none'; script-src 'unsafe-inline'; "
-                         "style-src 'unsafe-inline'; connect-src 'self'; "
+                         "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
                          "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -190,6 +189,9 @@ class Handler(BaseHTTPRequestHandler):
             # not on disk, and not in the URL (which lands in history and referrers).
             self._send(page.replace(b"__ENERGY_TOKEN__", TOKEN.encode()),
                        "text/html; charset=utf-8")
+        elif url.path == "/graph.css":
+            with open(os.path.join(REPO, "web", "graph.css"), "rb") as fh:
+                self._send(fh.read(), "text/css; charset=utf-8")
         elif url.path == "/data.json":
             mn = q.get("min", ["0.3"])[0]
             pl = q.get("plumbing", ["0"])[0]

@@ -1,0 +1,230 @@
+/* External presentation rules for the local call graph viewer. */
+/* Sequential blue ramp, five steps, from the design system's blue scale. Validated
+   with the palette validator in both modes (monotone lightness, adjacent ΔL ≥ 0.06,
+   light end clears 2:1 on its surface, single hue). Bins are ABSOLUTE %cpu, not
+   relative to the current peak, so a process keeps its colour between refreshes —
+   a rank-relative ramp would repaint everything every time the peak moved. */
+:root {
+  color-scheme: light;
+  --surface-1:      #fcfcfb;
+  --page:           #f9f9f7;
+  --text-primary:   #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted:     #898781;
+  --hairline:       #e1e0d9;
+  --axis:           #c3c2b7;
+  --ring:           rgba(11, 11, 11, .10);
+  --causal:         #a65a00;
+  --e1: #86b6ef;  --e2: #5598e7;  --e3: #2a78d6;  --e4: #1c5cab;  --e5: #0d366b;
+  --on-e1: #0b0b0b; --on-e2: #0b0b0b; --on-e3: #ffffff; --on-e4: #ffffff; --on-e5: #ffffff;
+  --critical: #d03b3b;
+  --process-bin-1: var(--e1); --process-bin-2: var(--e2); --process-bin-3: var(--e3);
+  --process-bin-4: var(--e4); --process-bin-5: var(--e5);
+  --process-bin-on-1: var(--on-e1); --process-bin-on-2: var(--on-e2); --process-bin-on-3: var(--on-e3);
+  --process-bin-on-4: var(--on-e4); --process-bin-on-5: var(--on-e5);
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --surface-1:      #1a1a19;
+    --page:           #0d0d0d;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #898781;
+    --hairline:       #2c2c2a;
+    --axis:           #383835;
+    --ring:           rgba(255, 255, 255, .10);
+    --causal:         #f0a84b;
+    --e1: #184f95;  --e2: #256abf;  --e3: #3987e5;  --e4: #6da7ec;  --e5: #b7d3f6;
+    --on-e1: #ffffff; --on-e2: #ffffff; --on-e3: #ffffff; --on-e4: #0b0b0b; --on-e5: #0b0b0b;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-1: #1a1a19; --page: #0d0d0d;
+  --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #898781;
+  --hairline: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,.10);
+  --causal: #f0a84b;
+  --e1: #184f95;  --e2: #256abf;  --e3: #3987e5;  --e4: #6da7ec;  --e5: #b7d3f6;
+  --on-e1: #ffffff; --on-e2: #ffffff; --on-e3: #ffffff; --on-e4: #0b0b0b; --on-e5: #0b0b0b;
+  --process-bin-1: var(--e1); --process-bin-2: var(--e2); --process-bin-3: var(--e3);
+  --process-bin-4: var(--e4); --process-bin-5: var(--e5);
+  --process-bin-on-1: var(--on-e1); --process-bin-on-2: var(--on-e2); --process-bin-on-3: var(--on-e3);
+  --process-bin-on-4: var(--on-e4); --process-bin-on-5: var(--on-e5);
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--page); color: var(--text-primary);
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  display: flex; flex-direction: column;
+}
+
+/* ---- controls: one row above the chart ---- */
+header {
+  display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+  padding: 10px 16px; background: var(--surface-1);
+  border-bottom: 1px solid var(--hairline);
+}
+h1 { font-size: 13px; font-weight: 600; margin: 0; letter-spacing: .01em; }
+h1 span { color: var(--text-muted); font-weight: 400; }
+.ctl { display: flex; align-items: center; gap: 7px; color: var(--text-secondary); }
+.ctl label { white-space: nowrap; }
+input[type=range] { width: 130px; accent-color: var(--e3); }
+button {
+  font: inherit; color: var(--text-secondary); background: transparent;
+  border: 1px solid var(--axis); border-radius: 6px; padding: 3px 9px; cursor: pointer;
+}
+button:hover { color: var(--text-primary); border-color: var(--text-muted); }
+button[aria-pressed="true"] { color: var(--text-primary); border-color: var(--text-muted); background: var(--page); }
+.val { font-variant-numeric: tabular-nums; color: var(--text-primary); min-width: 34px; }
+.spacer { flex: 1; }
+.status { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.status.stale { color: var(--critical); }
+.memory-status { white-space: nowrap; }
+.memory-status.warning { color: var(--causal); }
+.memory-status.critical { color: var(--critical); }
+
+/* ---- legend: sequential scale ---- */
+.legend { display: flex; align-items: center; gap: 0; }
+.legend .cap { color: var(--text-muted); margin-right: 8px; }
+.legend i {
+  display: block; width: 30px; height: 9px; border-radius: 1px;
+  box-shadow: inset 0 0 0 1px var(--ring);
+}
+.legend .step { display: flex; flex-direction: column; align-items: center; gap: 3px; }
+.legend .step b { font-weight: 400; font-size: 10px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+
+/* Fixed CPU bins are domain encodings; the variables above bind each bin to its theme palette. */
+.legend .bin-1 { background: var(--process-bin-1); }
+.legend .bin-2 { background: var(--process-bin-2); }
+.legend .bin-3 { background: var(--process-bin-3); }
+.legend .bin-4 { background: var(--process-bin-4); }
+.legend .bin-5 { background: var(--process-bin-5); }
+.node[data-bin="1"] { background: var(--process-bin-1); color: var(--process-bin-on-1); }
+.node[data-bin="2"] { background: var(--process-bin-2); color: var(--process-bin-on-2); }
+.node[data-bin="3"] { background: var(--process-bin-3); color: var(--process-bin-on-3); }
+.node[data-bin="4"] { background: var(--process-bin-4); color: var(--process-bin-on-4); }
+.node[data-bin="5"] { background: var(--process-bin-5); color: var(--process-bin-on-5); }
+
+/* ---- the diagram ---- */
+main { flex: 1; overflow: auto; position: relative; padding: 20px 24px 60px; }
+#stage { position: relative; width: var(--stage-width); height: var(--stage-height); }
+#edges { position: absolute; inset: 0; overflow: visible; pointer-events: none; }
+#edges path { fill: none; stroke: var(--axis); stroke-width: 1; }
+#edges path.causal { stroke: var(--causal); stroke-width: 1.5; stroke-dasharray: 5 4; }
+
+.node {
+  position: absolute; left: var(--node-x); top: var(--node-y); height: 26px; width: 208px;
+  display: flex; align-items: center; gap: 7px; padding: 0 8px;
+  border-radius: 5px; box-shadow: inset 0 0 0 1px var(--ring);
+  cursor: default; overflow: hidden; white-space: nowrap;
+}
+.node:focus-visible { outline: 2px solid var(--text-primary); outline-offset: 2px; }
+.node .n { font-variant-numeric: tabular-nums; font-weight: 600; font-size: 12px; }
+.node .t { overflow: hidden; text-overflow: ellipsis; font-size: 12px; }
+.node .k { margin-left: auto; font-size: 10px; opacity: .75; font-variant-numeric: tabular-nums; }
+/* Emphasis, used exactly once: the single heaviest process on screen. */
+.node.hot { box-shadow: inset 0 0 0 1px var(--ring), 0 0 0 2px var(--page), 0 0 0 3px var(--text-primary); }
+/* the "via" crumb: what was collapsed out of this edge */
+.via {
+  position: absolute; left: var(--via-x); top: var(--via-y); width: var(--via-width); height: 14px; font-size: 10px; color: var(--text-muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none;
+}
+.via.causal { color: var(--causal); font-weight: 600; }
+
+.db-links {
+  max-width: 1100px; margin: 0 0 18px; padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--causal) 45%, var(--hairline));
+  border-radius: 7px; background: var(--surface-1); color: var(--text-secondary);
+}
+.db-links .cap { color: var(--causal); font-weight: 600; margin-bottom: 3px; }
+.db-links .note { color: var(--text-muted); font-size: 11px; margin-bottom: 5px; }
+.db-links .link { font-family: ui-monospace, Menlo, monospace; font-size: 11px; padding-top: 2px; }
+
+/* ---- tooltip ---- */
+#tip {
+  position: fixed; left: var(--tip-x, 0); top: var(--tip-y, 0); z-index: 9; max-width: 430px; pointer-events: none; opacity: 0;
+  transition: opacity .09s; background: var(--surface-1); color: var(--text-primary);
+  border: 1px solid var(--hairline); border-radius: 7px; padding: 9px 11px;
+  box-shadow: 0 6px 22px rgba(0,0,0,.16);
+}
+#tip.on { opacity: 1; }
+#tip .big { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+#tip .lbl { color: var(--text-secondary); }
+#tip dl { display: grid; grid-template-columns: auto 1fr; gap: 1px 12px; margin: 7px 0 0; }
+#tip dt { color: var(--text-muted); }
+#tip dd { margin: 0; font-variant-numeric: tabular-nums; }
+/* Agent command lines carry multi-kilobyte JSON settings blobs. Clamp, or one
+   hover buries the whole diagram; the table view keeps the full string. */
+#tip .cmd {
+  margin-top: 8px; padding-top: 7px; border-top: 1px solid var(--hairline);
+  font-family: ui-monospace, Menlo, monospace; font-size: 10.5px;
+  color: var(--text-secondary); word-break: break-all;
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
+}
+
+/* ---- table view ---- */
+th.num, td.num { text-align: right; }
+table { border-collapse: collapse; width: 100%; max-width: 1100px; }
+caption { text-align: left; color: var(--text-muted); padding-bottom: 8px; }
+th, td { text-align: left; padding: 5px 12px 5px 0; border-bottom: 1px solid var(--hairline); }
+th { color: var(--text-muted); font-weight: 500; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; padding-right: 20px; }
+/* Chromium command lines run to several hundred characters; two clamped lines
+   identify the process, and the full string is on the cell's title. */
+td.cmd {
+  font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--text-secondary);
+  max-width: 460px; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+[hidden] { display: none; }
+.empty { color: var(--text-muted); padding: 40px 0; }
+
+/* ---- process list -------------------------------------------------------
+   The view the menu bar structurally cannot be: it stays open while you act, so a
+   stop can be watched landing instead of reported afterwards in a banner. */
+#procsWrap { overflow: auto; max-height: calc(100vh - 190px); max-width: 1100px; }
+#procsWrap table { width: 100%; max-width: none; font-size: 12px; }
+#procsWrap thead th {
+  position: sticky; top: 0; z-index: 1; background: var(--surface-1);
+  padding: 6px 10px 6px 0; white-space: nowrap;
+  border-bottom: 1px solid var(--hairline); cursor: pointer; user-select: none;
+}
+#procsWrap thead th.num { text-align: right; padding-right: 20px; }
+#procsWrap .sort-button { display: block; width: 100%; border: 0; padding: 0; text-align: inherit; background: transparent; font: inherit; color: inherit; cursor: pointer; }
+#procsWrap th.num .sort-button { text-align: right; }
+#procsWrap th:not(.num) .sort-button { cursor: pointer; }
+#procsWrap th:not(.num):not(:has(.sort-button)) { cursor: default; }
+#procsWrap .sort-button:focus-visible { outline: 2px solid var(--text-primary); outline-offset: 2px; }
+#procsWrap th .dir { color: var(--text-muted); }
+#procsWrap tbody tr:hover { background: var(--surface-1); }
+#procsWrap td.name { font-family: ui-monospace, Menlo, monospace; white-space: nowrap; }
+#procsWrap td.cmdcell {
+  color: var(--text-secondary); font-family: ui-monospace, Menlo, monospace; font-size: 11px;
+  max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+#procsWrap td.owner { color: var(--text-secondary); font-size: 11px; white-space: nowrap; }
+#procsWrap button.stop { font-size: 11px; padding: 1px 9px; }
+#procsWrap button.stop:hover { color: var(--critical); border-color: var(--critical); }
+#procsWrap button.stop[disabled] { opacity: .5; cursor: default; }
+/* A row mid-stop, a row already gone, and an ordinary row must all look different.
+   Reusing --causal for "in flight" keeps this on the validated palette: it is the
+   colour this page already uses for "evidence, not yet a fact". */
+#procsWrap tr.stopping { color: var(--causal); }
+#procsWrap tr.stopped { color: var(--text-muted); text-decoration: line-through; }
+#procsWrap tr.failed { color: var(--critical); }
+#procsWrap .rowstate { font-size: 11px; text-decoration: none; display: inline-block; }
+.toolbar { display: flex; gap: 10px; align-items: center; margin: 0 0 10px; flex-wrap: wrap; }
+.toolbar input[type=search] {
+  font: inherit; font-size: 12px; padding: 3px 9px; min-width: 240px;
+  border-radius: 6px; border: 1px solid var(--axis);
+  background: transparent; color: var(--text-primary);
+}
+.toolbar .count { color: var(--text-muted); font-size: 11px; }
+
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
